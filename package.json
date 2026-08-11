@@ -1,0 +1,13 @@
+{
+  "name": "brain-mcp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "seed": "node scripts/build-seed.mjs && bash scripts/apply-seed.sh"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

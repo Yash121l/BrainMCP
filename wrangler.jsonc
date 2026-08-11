@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "brain-mcp",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "observability": { "enabled": true },
+  "vars": {
+    "REPO": "Yash121l/brain",
+    "BRANCH": "main"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "brain-index",
+      "database_id": "a246c8a5-87cb-43e2-8a8e-6a65aa2c28b9"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  }
+  // secrets (wrangler secret put): BRAIN_TOKEN, GITHUB_TOKEN, WEBHOOK_SECRET
+}

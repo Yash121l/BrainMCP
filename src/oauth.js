@@ -2,7 +2,10 @@
 // claude.ai's custom-connector dialog only supports OAuth (no static headers), so:
 // discovery -> dynamic client registration -> PKCE code flow -> consent page where
 // the user pastes the BRAIN_TOKEN once. Issued tokens live in D1 (hashes only).
-// The static BRAIN_TOKEN keeps working as a plain bearer everywhere else.
+// Any managed key (see auth.js) works on the consent page; issued tokens inherit
+// that key's role + path-prefix scopes. BRAIN_TOKEN stays as break-glass admin.
+
+import { resolvePrincipal } from './auth.js';
 
 const enc = new TextEncoder();
 
@@ -92,7 +95,7 @@ export async function handleOauth(req, env, url) {
 <style>body{font-family:-apple-system,sans-serif;max-width:26rem;margin:15vh auto;padding:0 1rem;color:#eee;background:#111}
 input[type=password]{width:100%;padding:.6rem;font-size:1rem;border-radius:6px;border:1px solid #444;background:#1c1c1c;color:#eee}
 button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;border:0;background:#c96442;color:#fff;cursor:pointer}</style></head>
-<body><h2>🧠 BrainMCP</h2><p>A client is requesting access to the brain. Paste the access key (<code>BRAIN_TOKEN</code>).</p>
+<body><h2>🧠 BrainMCP</h2><p>A client is requesting access to the brain. Paste your access key — the connection inherits that key's scopes.</p>
 <form method="POST" action="/authorize">${params}
 <input type="password" name="access_key" placeholder="access key" autofocus required>
 <button type="submit">Authorize</button></form></body></html>`, { headers: { 'Content-Type': 'text/html' } });
@@ -100,13 +103,14 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
 
   if (url.pathname === '/authorize' && req.method === 'POST') {
     const form = await req.formData();
-    const key = form.get('access_key') || '';
-    if (key !== env.BRAIN_TOKEN) return new Response('wrong access key', { status: 403 });
+    const principal = await resolvePrincipal(env, form.get('access_key') || '');
+    if (!principal) return new Response('invalid or revoked access key', { status: 403 });
     const redirect_uri = form.get('redirect_uri') || '';
     const code = rand(32);
     await env.DB.prepare(
-      "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, challenge, exp) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))"
-    ).bind(await sha256hex(code), form.get('client_id') || '', redirect_uri, form.get('code_challenge') || '').run();
+      "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, challenge, exp, role, prefixes, key_id) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'), ?, ?, ?)"
+    ).bind(await sha256hex(code), form.get('client_id') || '', redirect_uri, form.get('code_challenge') || '',
+           principal.role, JSON.stringify(principal.prefixes), principal.keyId || null).run();
     const dest = new URL(redirect_uri);
     dest.searchParams.set('code', code);
     if (form.get('state')) dest.searchParams.set('state', form.get('state'));
@@ -116,13 +120,13 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
   if (url.pathname === '/token' && req.method === 'POST') {
     const form = await req.formData();
     const grant = form.get('grant_type');
-    const issue = async (client_id) => {
+    const issue = async (client_id, role, prefixes, key_id) => {
       const access = rand(32); const refresh = rand(32);
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, exp) VALUES (?, 'access', ?, datetime('now', '+30 days'))")
-          .bind(await sha256hex(access), client_id),
-        env.DB.prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, exp) VALUES (?, 'refresh', ?, datetime('now', '+90 days'))")
-          .bind(await sha256hex(refresh), client_id),
+        env.DB.prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', ?, datetime('now', '+30 days'), ?, ?, ?)")
+          .bind(await sha256hex(access), client_id, role || 'admin', prefixes || '[]', key_id || null),
+        env.DB.prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'refresh', ?, datetime('now', '+90 days'), ?, ?, ?)")
+          .bind(await sha256hex(refresh), client_id, role || 'admin', prefixes || '[]', key_id || null),
       ]);
       return Response.json({ access_token: access, token_type: 'Bearer', expires_in: 2592000, refresh_token: refresh, scope: 'brain' });
     };
@@ -139,15 +143,15 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
       if (form.get('redirect_uri') && form.get('redirect_uri') !== row.redirect_uri) {
         return Response.json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' }, { status: 400 });
       }
-      return issue(row.client_id);
+      return issue(row.client_id, row.role, row.prefixes, row.key_id);
     }
 
     if (grant === 'refresh_token') {
       const hash = await sha256hex(form.get('refresh_token') || '');
-      const row = await env.DB.prepare("SELECT client_id FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh' AND exp > datetime('now')").bind(hash).first();
+      const row = await env.DB.prepare("SELECT client_id, role, prefixes, key_id FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh' AND exp > datetime('now')").bind(hash).first();
       if (!row) return Response.json({ error: 'invalid_grant' }, { status: 400 });
       await env.DB.prepare('DELETE FROM oauth_tokens WHERE token_hash = ?').bind(hash).run(); // rotate
-      return issue(row.client_id);
+      return issue(row.client_id, row.role, row.prefixes, row.key_id);
     }
 
     return Response.json({ error: 'unsupported_grant_type' }, { status: 400 });

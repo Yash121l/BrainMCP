@@ -4,7 +4,8 @@
 
 import { parseNote, isIndexable, normalizeProject } from './parse.js';
 import { getFile, putFile, appendFile, multiCommit, fetchRepoTar, tarEntries } from './github.js';
-import { handleOauth, validOauthToken } from './oauth.js';
+import { handleOauth } from './oauth.js';
+import { resolvePrincipal, allowed, canWrite, isAdmin, createKey, listKeys, revokeKey } from './auth.js';
 import { handleApp } from './app.js';
 
 // ---------------------------------------------------------------- indexing
@@ -220,34 +221,40 @@ const TOOLS = [
   },
 ];
 
-async function callTool(env, name, args = {}) {
+async function callTool(env, name, args = {}, p) {
+  const deny = (why) => ({ error: `forbidden: ${why}` });
   switch (name) {
     case 'get_context': {
       const slug = normalizeProject(args.project || '');
       const out = {};
-      const now = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/_activity/NOW.md').first();
+      const now = allowed(p, 'vault/_activity/NOW.md')
+        ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/_activity/NOW.md').first()
+        : null;
       out.now = now?.body || null;
       const active = await env.DB.prepare(
         "SELECT path, project, status, updated, json_extract(frontmatter, '$.next') AS next FROM notes WHERE type = 'project' AND status = 'active' ORDER BY updated DESC"
       ).all();
-      out.active_projects = active.results.map((r) => ({
+      out.active_projects = active.results.filter((r) => allowed(p, r.path)).map((r) => ({
         ...r, next: r.next ? String(r.next).slice(0, 400) + (String(r.next).length > 400 ? ' …[truncated — read_note for full]' : '') : null,
       }));
       if (slug) {
+        if (!allowed(p, `vault/projects/${slug}.md`)) return deny(`your key has no access to project ${slug}`);
         const rules = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`vault/rules/${slug}.md`).first();
         out.binding_rules = rules ? rules.body : `(no rules/${slug}.md)`;
         const proj = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`vault/projects/${slug}.md`).first();
         out.project_note = proj ? proj.body : `(no projects/${slug}.md)`;
-        const dec = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first();
+        const dec = allowed(p, 'vault/logs/decisions.md')
+          ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first() : null;
         if (dec) {
           out.recent_decisions = dec.body.split('\n').filter((l) => l.startsWith('- **') && l.includes(`[[projects/${slug}]]`)).slice(-10);
         }
         const sess = await env.DB.prepare(
           "SELECT path, json_extract(frontmatter, '$.summary') AS summary, json_extract(frontmatter, '$.date') AS date FROM notes WHERE type = 'session' AND project = ? ORDER BY path DESC LIMIT 5"
         ).bind(slug).all();
-        out.recent_sessions = sess.results;
+        out.recent_sessions = sess.results.filter((r) => allowed(p, r.path));
       } else {
-        const dec = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first();
+        const dec = allowed(p, 'vault/logs/decisions.md')
+          ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first() : null;
         if (dec) out.recent_decisions = dec.body.split('\n').filter((l) => l.startsWith('- **')).slice(-10);
       }
       out.hint = 'Binding rules above are MANDATORY for this project. Write back at session end via append_session_log or save_session.';
@@ -263,15 +270,16 @@ async function callTool(env, name, args = {}) {
       if (args.project) { sql += ' AND n.project = ?'; binds.push(normalizeProject(args.project)); }
       if (args.folder) { sql += ' AND f.path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
       sql += ' ORDER BY rank LIMIT ?';
-      binds.push(limit);
+      binds.push(limit * 3); // over-fetch; scope filter may drop rows
       const res = await env.DB.prepare(sql).bind(...binds).all();
-      // dedupe by path keeping best-ranked snippet
+      // dedupe by path keeping best-ranked snippet; enforce key scopes
       const seen = new Map();
-      for (const r of res.results) if (!seen.has(r.path)) seen.set(r.path, r);
-      return { results: [...seen.values()] };
+      for (const r of res.results) if (allowed(p, r.path) && !seen.has(r.path)) seen.set(r.path, r);
+      return { results: [...seen.values()].slice(0, limit) };
     }
 
     case 'read_note': {
+      if (!allowed(p, args.path)) return deny(`no access to ${args.path}`);
       const r = await env.DB.prepare('SELECT path, body, frontmatter, updated FROM notes WHERE path = ?').bind(args.path).first();
       if (!r) {
         // fall through to GitHub for very fresh files not yet indexed
@@ -291,25 +299,28 @@ async function callTool(env, name, args = {}) {
       if (args.project) { sql += ' AND project = ?'; binds.push(normalizeProject(args.project)); }
       if (args.folder) { sql += ' AND path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
       sql += ' ORDER BY updated DESC, path DESC LIMIT ?';
-      binds.push(limit);
+      binds.push(limit * 3);
       const res = await env.DB.prepare(sql).bind(...binds).all();
-      return { notes: res.results };
+      return { notes: res.results.filter((r) => allowed(p, r.path)).slice(0, limit) };
     }
 
     case 'backlinks': {
       const noExt = args.path.replace(/\.md$/, '');
       const noVault = noExt.replace(/^vault\//, '');
       const base = noExt.split('/').pop();
+      if (!allowed(p, args.path)) return deny(`no access to ${args.path}`);
       const res = await env.DB.prepare('SELECT DISTINCT src FROM links WHERE dst IN (?, ?, ?)').bind(noExt, noVault, base).all();
-      return { backlinks: res.results.map((r) => r.src) };
+      return { backlinks: res.results.map((r) => r.src).filter((s) => allowed(p, s)) };
     }
 
     case 'links': {
+      if (!allowed(p, args.path)) return deny(`no access to ${args.path}`);
       const res = await env.DB.prepare('SELECT dst FROM links WHERE src = ?').bind(args.path).all();
       return { links: res.results.map((r) => r.dst) };
     }
 
     case 'append_session_log': {
+      if (!canWrite(p)) return deny('key is read-only');
       const slug = normalizeProject(args.project || '');
       const d = nowDate(); const t = nowTime(); const id = `cloud${randId(4)}`;
       const path = `vault/logs/sessions/${d}_${t}_${id}.md`;
@@ -337,12 +348,15 @@ ${args.next_steps || '- (none)'}
 ## Links
 - Project: ${slug ? `[[projects/${slug}]]` : '(none)'}
 `;
+      if (!allowed(p, path)) return deny(`no write access to ${path} (key needs the vault/logs/ prefix)`);
       await putFile(env, path, content, `session(${args.surface || 'cloud'}): ${slug || 'general'} — ${(args.summary || '').slice(0, 60)}`);
       await upsertLocal(env, path, content);
       return { ok: true, path, committed: true };
     }
 
     case 'log_decision': {
+      if (!canWrite(p)) return deny('key is read-only');
+      if (!allowed(p, 'vault/logs/decisions.md')) return deny('no write access to vault/logs/decisions.md');
       const slug = normalizeProject(args.project);
       const line = `- **${nowDate()}** — ${args.decision.trim()} (project:: [[projects/${slug}]]) — _${args.rationale.trim()}_\n`;
       const full = await appendFile(env, 'vault/logs/decisions.md', line, `decision(${slug}): ${args.decision.slice(0, 60)}`);
@@ -351,6 +365,8 @@ ${args.next_steps || '- (none)'}
     }
 
     case 'update_note': {
+      if (!canWrite(p)) return deny('key is read-only');
+      if (!allowed(p, args.path)) return deny(`no write access to ${args.path}`);
       const existing = await getFile(env, args.path);
       await putFile(env, args.path, args.content, args.message || `update: ${args.path}`, existing?.sha);
       await upsertLocal(env, args.path, args.content);
@@ -358,7 +374,10 @@ ${args.next_steps || '- (none)'}
     }
 
     case 'save_session': {
+      if (!canWrite(p)) return deny('key is read-only');
       if (!Array.isArray(args.files) || !args.files.length) return { error: 'files[] required' };
+      const blockedPath = args.files.find((f) => !allowed(p, f.path));
+      if (blockedPath) return deny(`no write access to ${blockedPath.path}`);
       const sha = await multiCommit(env, args.files, args.message);
       for (const f of args.files) await upsertLocal(env, f.path, f.content);
       return { ok: true, commit: sha, files: args.files.map((f) => f.path) };
@@ -369,10 +388,11 @@ ${args.next_steps || '- (none)'}
         "SELECT path, json_extract(frontmatter, '$.name') AS name, json_extract(frontmatter, '$.description') AS description FROM notes WHERE path LIKE 'skills/%/SKILL.md' ORDER BY path"
       ).all();
       const mappings = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('skills/mappings.md').first();
-      return { skills: res.results, mappings: 'skills/mappings.yaml in repo Yash121l/brain' };
+      return { skills: res.results.filter((r) => allowed(p, r.path)), mappings: 'skills/mappings.yaml in repo Yash121l/brain' };
     }
 
     case 'get_skill': {
+      if (!allowed(p, `skills/${args.name}/SKILL.md`)) return deny(`no access to skill ${args.name}`);
       const r = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`skills/${args.name}/SKILL.md`).first();
       if (!r) return { error: `no skill named ${args.name}` };
       return { name: args.name, skill: r.body };
@@ -392,7 +412,7 @@ function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-async function handleRpc(env, msg) {
+async function handleRpc(env, msg, principal) {
   const { id, method, params } = msg;
   switch (method) {
     case 'initialize':
@@ -407,7 +427,7 @@ async function handleRpc(env, msg) {
       return rpcResult(id, { tools: TOOLS });
     case 'tools/call': {
       try {
-        const result = await callTool(env, params.name, params.arguments || {});
+        const result = await callTool(env, params.name, params.arguments || {}, principal);
         return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: false });
       } catch (e) {
         return rpcResult(id, { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
@@ -427,16 +447,9 @@ async function handleRpc(env, msg) {
 
 // ---------------------------------------------------------------- auth + webhook
 
-async function authorized(req, env) {
+async function getPrincipal(req, env) {
   const h = req.headers.get('Authorization') || '';
-  const token = h.replace(/^Bearer\s+/i, '');
-  if (!token || !env.BRAIN_TOKEN) return false;
-  if (token.length === env.BRAIN_TOKEN.length) {
-    let diff = 0;
-    for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ env.BRAIN_TOKEN.charCodeAt(i);
-    if (diff === 0) return true;
-  }
-  return validOauthToken(env, token); // tokens issued by the OAuth layer (claude.ai connectors)
+  return resolvePrincipal(env, h.replace(/^Bearer\s+/i, ''));
 }
 
 async function verifyWebhook(req, env, rawBody) {
@@ -497,7 +510,8 @@ export default {
     }
 
     if (url.pathname === '/admin/reindex' && req.method === 'POST') {
-      if (!(await authorized(req, env))) return new Response('unauthorized', { status: 401 });
+      const p = await getPrincipal(req, env);
+      if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
       try {
         const n = await fullReindex(env);
         return Response.json({ ok: true, indexed: n });
@@ -510,7 +524,8 @@ export default {
       if (req.method === 'GET') return new Response('SSE not offered; POST JSON-RPC here', { status: 405 });
       if (req.method === 'DELETE') return new Response(null, { status: 200 });
       if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
-      if (!(await authorized(req, env))) {
+      const principal = await getPrincipal(req, env);
+      if (!principal) {
         return Response.json(rpcError(null, -32000, 'unauthorized'), {
           status: 401,
           headers: { 'WWW-Authenticate': `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"` },
@@ -521,7 +536,7 @@ export default {
       const msgs = Array.isArray(body) ? body : [body];
       const replies = [];
       for (const m of msgs) {
-        const r = await handleRpc(env, m);
+        const r = await handleRpc(env, m, principal);
         if (r !== null && m.id !== undefined) replies.push(r);
       }
       if (!replies.length) return new Response(null, { status: 202 });

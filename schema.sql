@@ -38,11 +38,31 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
   client_id    TEXT,
   redirect_uri TEXT,
   challenge    TEXT,
-  exp          TEXT
+  exp          TEXT,
+  role         TEXT,
+  prefixes     TEXT,
+  key_id       TEXT
 );
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash TEXT PRIMARY KEY,
   kind       TEXT,   -- access | refresh
   client_id  TEXT,
-  exp        TEXT
+  exp        TEXT,
+  role       TEXT DEFAULT 'admin',   -- inherited from the key used at consent
+  prefixes   TEXT DEFAULT '[]',
+  key_id     TEXT                     -- managed key that minted this token (revocation link)
+);
+
+-- Managed access keys: named, scoped (role + path prefixes), revocable.
+-- The BRAIN_TOKEN env secret is break-glass admin only.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id        TEXT PRIMARY KEY,
+  key_hash  TEXT UNIQUE,
+  name      TEXT,
+  role      TEXT,               -- read | write | admin
+  prefixes  TEXT,               -- JSON array of path prefixes; [] = everything
+  created   TEXT,
+  expires   TEXT,               -- NULL = never
+  revoked   INTEGER DEFAULT 0,
+  last_used TEXT
 );

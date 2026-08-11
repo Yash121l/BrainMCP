@@ -26,3 +26,23 @@ CREATE INDEX IF NOT EXISTS idx_links_dst ON links (dst);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(path UNINDEXED, title, heading, text);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
+-- OAuth layer (claude.ai connectors). Hashes only; rows expire.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id     TEXT PRIMARY KEY,
+  redirect_uris TEXT,
+  created       TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash    TEXT PRIMARY KEY,
+  client_id    TEXT,
+  redirect_uri TEXT,
+  challenge    TEXT,
+  exp          TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash TEXT PRIMARY KEY,
+  kind       TEXT,   -- access | refresh
+  client_id  TEXT,
+  exp        TEXT
+);

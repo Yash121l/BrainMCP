@@ -118,21 +118,37 @@ export async function fetchRepoTar(env) {
   return await new Response(gunzip).arrayBuffer();
 }
 
-/** Minimal tar reader: yields {path, text} for .md entries (strips the top-level dir). */
+/** Minimal tar reader: yields {path, text} for file entries (strips the top-level dir).
+ *  Handles long paths via ustar prefix field, pax extended headers ('x'), and GNU 'L'. */
 export function* tarEntries(buf) {
   const u8 = new Uint8Array(buf);
   const dec = new TextDecoder();
   let off = 0;
+  let pendingName = null; // set by a pax/'L' header for the NEXT entry
   while (off + 512 <= u8.length) {
     const name = dec.decode(u8.subarray(off, off + 100)).replace(/\0.*$/, '');
-    if (!name) break;
     const sizeOctal = dec.decode(u8.subarray(off + 124, off + 136)).replace(/\0.*$/, '').trim();
     const size = parseInt(sizeOctal || '0', 8) || 0;
     const typeflag = String.fromCharCode(u8[off + 156]);
+    if (!name && !size && (typeflag === '\0' || typeflag === '')) break; // zero block = end
     const dataStart = off + 512;
-    if (typeflag === '0' || typeflag === '\0' || typeflag === '') {
-      const path = name.split('/').slice(1).join('/'); // strip "owner-repo-sha/" prefix
-      if (path) yield { path, text: () => dec.decode(u8.subarray(dataStart, dataStart + size)) };
+    const dataEnd = dataStart + size;
+    if (typeflag === 'x' || typeflag === 'X') {
+      const m = dec.decode(u8.subarray(dataStart, dataEnd)).match(/\d+ path=([^\n]*)\n/);
+      if (m) pendingName = m[1];
+    } else if (typeflag === 'L') {
+      pendingName = dec.decode(u8.subarray(dataStart, dataEnd)).replace(/\0.*$/, '');
+    } else if (typeflag === '0' || typeflag === '\0' || typeflag === '') {
+      let full = pendingName;
+      if (!full) {
+        const prefix = dec.decode(u8.subarray(off + 345, off + 500)).replace(/\0.*$/, '');
+        full = prefix ? `${prefix}/${name}` : name;
+      }
+      pendingName = null;
+      const path = full.split('/').slice(1).join('/'); // strip "owner-repo-sha/" prefix
+      if (path) yield { path, text: () => dec.decode(u8.subarray(dataStart, dataEnd)) };
+    } else {
+      pendingName = null;
     }
     off = dataStart + Math.ceil(size / 512) * 512;
   }

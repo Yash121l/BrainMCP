@@ -4,6 +4,8 @@
 
 import { parseNote, isIndexable, normalizeProject } from './parse.js';
 import { getFile, putFile, appendFile, multiCommit, fetchRepoTar, tarEntries } from './github.js';
+import { handleOauth, validOauthToken } from './oauth.js';
+import { handleApp } from './app.js';
 
 // ---------------------------------------------------------------- indexing
 
@@ -425,13 +427,16 @@ async function handleRpc(env, msg) {
 
 // ---------------------------------------------------------------- auth + webhook
 
-function authorized(req, env) {
+async function authorized(req, env) {
   const h = req.headers.get('Authorization') || '';
   const token = h.replace(/^Bearer\s+/i, '');
-  if (!token || !env.BRAIN_TOKEN || token.length !== env.BRAIN_TOKEN.length) return false;
-  let diff = 0;
-  for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ env.BRAIN_TOKEN.charCodeAt(i);
-  return diff === 0;
+  if (!token || !env.BRAIN_TOKEN) return false;
+  if (token.length === env.BRAIN_TOKEN.length) {
+    let diff = 0;
+    for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ env.BRAIN_TOKEN.charCodeAt(i);
+    if (diff === 0) return true;
+  }
+  return validOauthToken(env, token); // tokens issued by the OAuth layer (claude.ai connectors)
 }
 
 async function verifyWebhook(req, env, rawBody) {
@@ -450,6 +455,14 @@ async function verifyWebhook(req, env, rawBody) {
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
+
+    // OAuth 2.1 layer for claude.ai connectors (discovery, DCR, PKCE, consent)
+    const oauthRes = await handleOauth(req, env, url);
+    if (oauthRes) return oauthRes;
+
+    // Browser UI: login + note browser + link graph
+    const appRes = await handleApp(req, env, url);
+    if (appRes) return appRes;
 
     if (url.pathname === '/health') {
       const n = await env.DB.prepare('SELECT COUNT(*) AS c FROM notes').first().catch(() => ({ c: -1 }));
@@ -484,7 +497,7 @@ export default {
     }
 
     if (url.pathname === '/admin/reindex' && req.method === 'POST') {
-      if (!authorized(req, env)) return new Response('unauthorized', { status: 401 });
+      if (!(await authorized(req, env))) return new Response('unauthorized', { status: 401 });
       try {
         const n = await fullReindex(env);
         return Response.json({ ok: true, indexed: n });
@@ -497,8 +510,11 @@ export default {
       if (req.method === 'GET') return new Response('SSE not offered; POST JSON-RPC here', { status: 405 });
       if (req.method === 'DELETE') return new Response(null, { status: 200 });
       if (req.method !== 'POST') return new Response('method not allowed', { status: 405 });
-      if (!authorized(req, env)) {
-        return Response.json(rpcError(null, -32000, 'unauthorized'), { status: 401 });
+      if (!(await authorized(req, env))) {
+        return Response.json(rpcError(null, -32000, 'unauthorized'), {
+          status: 401,
+          headers: { 'WWW-Authenticate': `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"` },
+        });
       }
       let body;
       try { body = await req.json(); } catch { return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 }); }

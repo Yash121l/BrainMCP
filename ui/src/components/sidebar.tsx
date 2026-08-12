@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronRightIcon,
   FileTextIcon,
@@ -18,7 +18,215 @@ import { RoleBadge } from '@/components/role-badge'
 
 export type Tab = 'notes' | 'graph' | 'keys'
 
-const DEFAULT_OPEN = new Set(['vault/projects', 'vault/rules', 'skills'])
+const STORAGE_KEY = 'brain.tree.expanded'
+const DEFAULT_EXPANDED = ['vault', 'skills']
+const INDENT = 14 // px per depth level
+const ROW_BASE_PAD = 8 // px before the chevron at depth 0
+
+// ---------------------------------------------------------------- tree model
+
+type Folder = {
+  name: string
+  path: string
+  folders: Folder[]
+  files: NoteMeta[]
+  /** total notes below this folder, at any depth */
+  count: number
+}
+
+const fileLabel = (n: NoteMeta) =>
+  n.title || (n.path.split('/').pop() as string).replace(/\.md$/, '')
+
+/** Turn flat note paths into a nested folder tree (folders first, then files, A→Z). */
+function buildTree(notes: NoteMeta[]): Folder {
+  type Draft = Omit<Folder, 'folders'> & { folders: Map<string, Draft> }
+  const root: Draft = { name: '', path: '', folders: new Map(), files: [], count: 0 }
+
+  for (const note of notes) {
+    const segments = note.path.split('/')
+    segments.pop() // the file itself
+    let node = root
+    node.count++
+    for (const segment of segments) {
+      let child = node.folders.get(segment)
+      if (!child) {
+        child = {
+          name: segment,
+          path: node.path ? `${node.path}/${segment}` : segment,
+          folders: new Map(),
+          files: [],
+          count: 0,
+        }
+        node.folders.set(segment, child)
+      }
+      node = child
+      node.count++
+    }
+    node.files.push(note)
+  }
+
+  const finalize = (draft: Draft): Folder => ({
+    name: draft.name,
+    path: draft.path,
+    count: draft.count,
+    folders: [...draft.folders.values()]
+      .map(finalize)
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    files: draft.files.sort((a, b) => fileLabel(a).localeCompare(fileLabel(b))),
+  })
+
+  return finalize(root)
+}
+
+/** Every ancestor folder path of a note: vault/logs/sessions/x.md → vault, vault/logs, … */
+function ancestorsOf(path: string): string[] {
+  const segments = path.split('/')
+  segments.pop()
+  const out: string[] = []
+  let acc = ''
+  for (const s of segments) {
+    acc = acc ? `${acc}/${s}` : s
+    out.push(acc)
+  }
+  return out
+}
+
+function loadExpanded(): Set<string> {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw)
+      if (Array.isArray(parsed)) return new Set(parsed.filter((v) => typeof v === 'string'))
+    }
+  } catch {
+    /* private mode / corrupt value — fall back to the defaults */
+  }
+  return new Set(DEFAULT_EXPANDED)
+}
+
+// ---------------------------------------------------------------- tree rows
+
+function FolderRow({
+  node,
+  depth,
+  open,
+  onToggle,
+}: {
+  node: Folder
+  depth: number
+  open: boolean
+  onToggle: (path: string) => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(node.path)}
+      title={node.path}
+      aria-expanded={open}
+      style={{ paddingLeft: ROW_BASE_PAD + depth * INDENT }}
+      className="flex w-full items-center gap-1 rounded-md py-1 pr-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+    >
+      <ChevronRightIcon
+        className={cn('size-3.5 shrink-0 transition-transform duration-150', open && 'rotate-90')}
+      />
+      <span className="truncate">{node.name}</span>
+      <span className="ml-auto pl-2 text-[10px] tabular-nums text-muted-foreground/50">
+        {node.count}
+      </span>
+    </button>
+  )
+}
+
+function FileRow({
+  note,
+  depth,
+  active,
+  onOpenNote,
+  activeRef,
+}: {
+  note: NoteMeta
+  depth: number
+  active: boolean
+  onOpenNote: (path: string) => void
+  activeRef: (el: HTMLButtonElement | null) => void
+}) {
+  return (
+    <button
+      type="button"
+      ref={active ? activeRef : undefined}
+      onClick={() => onOpenNote(note.path)}
+      title={note.path}
+      style={{ paddingLeft: ROW_BASE_PAD + depth * INDENT + 4 }}
+      className={cn(
+        'flex w-full items-center gap-2 rounded-md py-1 pr-2 text-left text-[13px] transition-colors',
+        active
+          ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+          : 'text-foreground/80 hover:bg-sidebar-accent/50 hover:text-foreground',
+      )}
+    >
+      <span
+        aria-hidden
+        className="size-1.5 shrink-0 rounded-full"
+        style={{ background: typeColor(note.type) }}
+      />
+      <span className="truncate">{fileLabel(note)}</span>
+    </button>
+  )
+}
+
+function TreeLevel({
+  node,
+  depth,
+  expanded,
+  onToggle,
+  current,
+  onOpenNote,
+  activeRef,
+}: {
+  node: Folder
+  depth: number
+  expanded: Set<string>
+  onToggle: (path: string) => void
+  current: string | null
+  onOpenNote: (path: string) => void
+  activeRef: (el: HTMLButtonElement | null) => void
+}) {
+  return (
+    <>
+      {node.folders.map((child) => {
+        const open = expanded.has(child.path)
+        return (
+          <div key={child.path}>
+            <FolderRow node={child} depth={depth} open={open} onToggle={onToggle} />
+            {open && (
+              <TreeLevel
+                node={child}
+                depth={depth + 1}
+                expanded={expanded}
+                onToggle={onToggle}
+                current={current}
+                onOpenNote={onOpenNote}
+                activeRef={activeRef}
+              />
+            )}
+          </div>
+        )
+      })}
+      {node.files.map((file) => (
+        <FileRow
+          key={file.path}
+          note={file}
+          depth={depth}
+          active={current === file.path}
+          onOpenNote={onOpenNote}
+          activeRef={activeRef}
+        />
+      ))}
+    </>
+  )
+}
+
+// ---------------------------------------------------------------- sidebar
 
 export function Sidebar({
   me,
@@ -39,25 +247,51 @@ export function Sidebar({
   onOpenNote: (path: string) => void
   onSearch: () => void
 }) {
-  const groups = useMemo(() => {
-    const g = new Map<string, NoteMeta[]>()
-    for (const n of notes) {
-      const dir = n.path.split('/').slice(0, -1).join('/') || '(root)'
-      const list = g.get(dir)
-      if (list) list.push(n)
-      else g.set(dir, [n])
-    }
-    return [...g.entries()].sort(([a], [b]) => a.localeCompare(b))
-  }, [notes])
+  const tree = useMemo(() => buildTree(notes), [notes])
+  const [expanded, setExpanded] = useState<Set<string>>(loadExpanded)
 
-  const [open, setOpen] = useState<Set<string>>(DEFAULT_OPEN)
-  const toggle = (dir: string) =>
-    setOpen((prev) => {
+  const toggle = useCallback((path: string) => {
+    setExpanded((prev) => {
       const next = new Set(prev)
-      if (next.has(dir)) next.delete(dir)
-      else next.add(dir)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
       return next
     })
+  }, [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify([...expanded]))
+    } catch {
+      /* storage unavailable — expansion just won't persist */
+    }
+  }, [expanded])
+
+  // reveal the active note wherever it was opened from (palette, wikilink, backlink)
+  useEffect(() => {
+    if (!current) return
+    const ancestors = ancestorsOf(current)
+    setExpanded((prev) => {
+      if (ancestors.every((a) => prev.has(a))) return prev
+      const next = new Set(prev)
+      for (const a of ancestors) next.add(a)
+      return next
+    })
+  }, [current])
+
+  // Scroll the active row into view once per note change — the ref callback is
+  // re-invoked whenever `current` changes or the row (re)mounts after its
+  // ancestors expand, and left alone when unrelated folders are toggled.
+  const scrolledTo = useRef<string | null>(null)
+  const setActiveRow = useCallback(
+    (el: HTMLButtonElement | null) => {
+      if (el && current && scrolledTo.current !== current) {
+        scrolledTo.current = current
+        el.scrollIntoView({ block: 'nearest' })
+      }
+    },
+    [current],
+  )
 
   const navItems: { id: Tab; label: string; icon: typeof FileTextIcon }[] = [
     { id: 'notes', label: 'Notes', icon: FileTextIcon },
@@ -112,59 +346,23 @@ export function Sidebar({
       <Separator />
 
       <ScrollArea className="min-h-0 flex-1">
-        <div className="p-2 pb-6">
+        <div className="p-1.5 pb-6">
           {loading ? (
-            <div className="grid gap-2 px-1 py-1">
+            <div className="grid gap-2 px-1.5 py-1">
               {Array.from({ length: 10 }).map((_, i) => (
                 <Skeleton key={i} className="h-5 w-full" />
               ))}
             </div>
           ) : (
-            groups.map(([dir, items]) => {
-              const isOpen = open.has(dir)
-              return (
-                <div key={dir} className="mb-0.5">
-                  <button
-                    onClick={() => toggle(dir)}
-                    className="flex w-full items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium tracking-wide text-muted-foreground uppercase transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-                  >
-                    <ChevronRightIcon
-                      className={cn('size-3 transition-transform', isOpen && 'rotate-90')}
-                    />
-                    <span className="truncate">{dir}</span>
-                    <span className="ml-auto text-[10px] tabular-nums text-muted-foreground/60">
-                      {items.length}
-                    </span>
-                  </button>
-                  {isOpen && (
-                    <div className="mt-0.5 grid">
-                      {items.map((n) => (
-                        <button
-                          key={n.path}
-                          onClick={() => onOpenNote(n.path)}
-                          title={n.path}
-                          className={cn(
-                            'flex items-center gap-2 rounded-md py-1 pr-2 pl-6 text-left text-[13px] transition-colors',
-                            current === n.path
-                              ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-                              : 'text-foreground/80 hover:bg-sidebar-accent/50 hover:text-foreground',
-                          )}
-                        >
-                          <span
-                            aria-hidden
-                            className="size-1.5 shrink-0 rounded-full"
-                            style={{ background: typeColor(n.type) }}
-                          />
-                          <span className="truncate">
-                            {n.title || n.path.split('/').pop()?.replace(/\.md$/, '')}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )
-            })
+            <TreeLevel
+              node={tree}
+              depth={0}
+              expanded={expanded}
+              onToggle={toggle}
+              current={current}
+              onOpenNote={onOpenNote}
+              activeRef={setActiveRow}
+            />
           )}
         </div>
       </ScrollArea>

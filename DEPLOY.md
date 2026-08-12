@@ -8,7 +8,15 @@ secrets are re-generated. Nothing in the old account is precious.
 - `wrangler` logged into the **target** Cloudflare account (`npx wrangler login`)
 - A **fine-grained GitHub PAT**: repo `Yash121l/brain` only, permission **Contents: Read & write**
 
-## One command
+## CI (normal path)
+Every push to `main` auto-deploys via GitHub Actions (`.github/workflows/deploy.yml`).
+It needs two repo secrets (Settings → Secrets and variables → Actions), or via CLI:
+```bash
+gh secret set CLOUDFLARE_API_TOKEN   # dash.cloudflare.com → My Profile → API Tokens → "Edit Cloudflare Workers" template
+gh secret set CLOUDFLARE_ACCOUNT_ID  # `npx wrangler whoami` on the target account
+```
+
+## One command (first-time account setup)
 ```bash
 git clone https://github.com/Yash121l/BrainMCP.git && cd BrainMCP && npm install
 npx wrangler login          # into the TARGET account

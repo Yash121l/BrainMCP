@@ -22,6 +22,9 @@
       "/health"
     ]
   },
+  "routes": [
+    { "pattern": "brain.yashlunawat.com", "custom_domain": true }
+  ],
   "vars": {
     "REPO": "Yash121l/brain",
     "BRANCH": "main"

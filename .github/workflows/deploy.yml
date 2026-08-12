@@ -19,16 +19,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: ui/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix ui --no-audit --no-fund
 
       - name: Build UI
-        run: |
-          npm ci --prefix ui --no-audit --no-fund
-          npm run build --prefix ui
+        run: npm run build --prefix ui
 
       - name: Deploy worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

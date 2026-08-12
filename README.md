@@ -1,7 +1,7 @@
 # BrainMCP
 
 Cloudflare Worker that serves the private **`Yash121l/brain`** repo (the second-brain
-vault) as an **MCP server**: `https://brain-mcp.yashlunawat-tech.workers.dev/mcp`
+vault) as an **MCP server**: `https://brain.yashlunawat.com/mcp`
 (streamable HTTP JSON-RPC, bearer auth, zero npm runtime deps).
 
 **git is the source of truth; D1 is a disposable accelerator.** A GitHub push webhook

@@ -164,7 +164,7 @@ const TOOLS = [
   },
   {
     name: 'log_decision',
-    description: 'Append a decision to vault/logs/decisions.md in the exact vault format (date, decision, project link, rationale). Use for real decisions only.',
+    description: 'Append a decision to vault/logs/decisions.md as a rich block (### [date] title, Chosen/Why/Project). Use for real decisions only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -246,7 +246,9 @@ async function callTool(env, name, args = {}, p) {
         const dec = allowed(p, 'vault/logs/decisions.md')
           ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first() : null;
         if (dec) {
-          out.recent_decisions = dec.body.split('\n').filter((l) => l.startsWith('- **') && l.includes(`[[projects/${slug}]]`)).slice(-10);
+          out.recent_decisions = dec.body.split(/\n(?=### \[)/)
+            .filter((b) => b.startsWith('### [') && (b.includes(`[[projects/${slug}]]`) || b.includes(`**Project:** ${slug}`)))
+            .slice(-10).map((b) => b.trim().slice(0, 500));
         }
         const sess = await env.DB.prepare(
           "SELECT path, json_extract(frontmatter, '$.summary') AS summary, json_extract(frontmatter, '$.date') AS date FROM notes WHERE type = 'session' AND project = ? ORDER BY path DESC LIMIT 5"
@@ -255,7 +257,8 @@ async function callTool(env, name, args = {}, p) {
       } else {
         const dec = allowed(p, 'vault/logs/decisions.md')
           ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first() : null;
-        if (dec) out.recent_decisions = dec.body.split('\n').filter((l) => l.startsWith('- **')).slice(-10);
+        if (dec) out.recent_decisions = dec.body.split(/\n(?=### \[)/)
+          .filter((b) => b.startsWith('### [')).slice(-10).map((b) => b.trim().slice(0, 500));
       }
       out.hint = 'Binding rules above are MANDATORY for this project. Write back at session end via append_session_log or save_session.';
       return out;
@@ -358,10 +361,12 @@ ${args.next_steps || '- (none)'}
       if (!canWrite(p)) return deny('key is read-only');
       if (!allowed(p, 'vault/logs/decisions.md')) return deny('no write access to vault/logs/decisions.md');
       const slug = normalizeProject(args.project);
-      const line = `- **${nowDate()}** — ${args.decision.trim()} (project:: [[projects/${slug}]]) — _${args.rationale.trim()}_\n`;
-      const full = await appendFile(env, 'vault/logs/decisions.md', line, `decision(${slug}): ${args.decision.slice(0, 60)}`);
+      const d = args.decision.trim();
+      const title = d.length > 90 ? d.slice(0, 90) + '…' : d;
+      const block = `\n### [${nowDate()}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${args.rationale.trim()}\n- **Project:** [[projects/${slug}]]\n`;
+      const full = await appendFile(env, 'vault/logs/decisions.md', block, `decision(${slug}): ${d.slice(0, 60)}`);
       await upsertLocal(env, 'vault/logs/decisions.md', full);
-      return { ok: true, appended: line.trim() };
+      return { ok: true, appended: block.trim() };
     }
 
     case 'update_note': {

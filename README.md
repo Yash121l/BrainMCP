@@ -12,6 +12,10 @@ graph, FTS5 chunks) in sync with the brain repo. Wipe it, reindex, identical res
 - `src/index.js` — router, MCP JSON-RPC handler, 12 tools, webhook ingest, tarball reindex, cron
 - `src/parse.js` — frontmatter / wikilink / chunking (shared with the seed script)
 - `src/github.js` — Contents API + Git Data API (atomic multi-file commits) + tarball reader
+- `src/auth.js` / `src/oauth.js` — scoped access keys + the OAuth 2.1 layer for claude.ai connectors
+- `src/app.js` — session login (`POST /app/login`) + the `/app/api/*` JSON API behind the web UI
+- `ui/` — the browser UI: Vite + React + Tailwind + shadcn/ui SPA (notes, graph, keys),
+  uploaded as Workers static assets and served at `/`
 - `schema.sql` — D1 schema
 - `scripts/build-seed.mjs` + `scripts/apply-seed.sh` — local full (re)seed: `npm run seed`
   (reads the brain repo at `$BRAIN_DIR`, default `~/obsidian/brain`)
@@ -24,7 +28,7 @@ git commits to the brain repo. `list_skills` `get_skill` — serve the skills li
 
 ## Ops
 ```bash
-npx wrangler deploy                 # deploy
+npm run deploy                      # build ui/ then wrangler deploy
 curl .../health                     # index status
 curl -X POST -H "Authorization: Bearer $BRAIN_TOKEN" .../admin/reindex   # full rebuild
 ```
@@ -32,5 +36,5 @@ Secrets (`npx wrangler secret put`): `BRAIN_TOKEN` (MCP bearer), `GITHUB_TOKEN`
 (fine-grained PAT, Contents R/W on `Yash121l/brain` only), `WEBHOOK_SECRET` (HMAC).
 Local credentials copy: `~/.config/brain-mcp/credentials`.
 
-Endpoints: `POST /mcp`, `POST /webhook`, `POST /admin/reindex`, `GET /health`.
+Endpoints: `GET /` (web UI), `POST /mcp`, `POST /webhook`, `POST /admin/reindex`, `GET /health`.
 Connection guide for every surface: `docs/CONNECT.md` in the brain repo.

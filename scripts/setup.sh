@@ -38,6 +38,8 @@ if [ -n "${GH_PAT:-}" ]; then printf '%s' "$GH_PAT" | npx wrangler secret put GI
 else echo ">> now paste the fine-grained PAT (Contents R/W on Yash121l/brain only):"; npx wrangler secret put GITHUB_TOKEN; fi
 
 echo "== 4/6 deploy =="
+# the browser UI is a React SPA uploaded as static assets — build it first
+(cd ui && npm install --no-audit --no-fund && npm run build)
 URL=$(npx wrangler deploy 2>&1 | grep -o 'https://[^ ]*workers.dev' | head -1)
 echo "deployed: $URL"
 grep -q "^MCP_URL=" ~/.config/brain-mcp/credentials && sed -i '' "s|^MCP_URL=.*|MCP_URL=$URL/mcp|" ~/.config/brain-mcp/credentials || echo "MCP_URL=$URL/mcp" >> ~/.config/brain-mcp/credentials

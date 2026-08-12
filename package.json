@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
+    "ui:build": "npm --prefix ui run build",
+    "ui:dev": "npm --prefix ui run dev",
+    "deploy": "npm run ui:build && wrangler deploy",
     "dev": "wrangler dev",
     "seed": "node scripts/build-seed.mjs && bash scripts/apply-seed.sh"
   },

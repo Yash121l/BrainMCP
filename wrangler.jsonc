@@ -4,6 +4,24 @@
   "main": "src/index.js",
   "compatibility_date": "2026-08-01",
   "observability": { "enabled": true },
+  // React SPA (ui/) served as static assets from the root; the Worker keeps
+  // first claim on the API/OAuth/MCP routes below.
+  "assets": {
+    "directory": "ui/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/mcp",
+      "/webhook",
+      "/admin/*",
+      "/app",
+      "/app/*",
+      "/authorize",
+      "/token",
+      "/register",
+      "/.well-known/*",
+      "/health"
+    ]
+  },
   "vars": {
     "REPO": "Yash121l/brain",
     "BRANCH": "main"

@@ -19,7 +19,7 @@ The script prints the new URL and a checklist of the places that reference it
 and `~/.codex/config.toml` on each machine; the claude.ai connector).
 
 ## Access keys
-Keys live in D1 (`api_keys`), managed in the web UI (`<url>/app` → Keys tab, admin only).
+Keys live in D1 (`api_keys`), managed in the web UI (`<url>` → Keys tab, admin only).
 They do NOT migrate across accounts — mint fresh ones after moving.
 - role: `read` | `write` | `admin`; prefixes: path scopes (`[]` = everything)
 - a collaborator key for one project: role `write`, prefixes

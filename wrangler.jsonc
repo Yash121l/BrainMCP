@@ -22,9 +22,10 @@
       "/health"
     ]
   },
-  "routes": [
-    { "pattern": "brain.yashlunawat.com", "custom_domain": true }
-  ],
+  // brain.yashlunawat.com is attached as a Workers custom domain in the dashboard.
+  // Deliberately NOT declared here: managing it from CI requires Zone->Workers
+  // Routes:Edit on the API token, which the CI token intentionally doesn't have.
+  // If the domain ever detaches, re-add it in dash -> Workers -> brain-mcp -> Domains.
   "vars": {
     "REPO": "Yash121l/brain",
     "BRANCH": "main"

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ActivityIcon,
   ChevronRightIcon,
   FileTextIcon,
   KeyRoundIcon,
@@ -16,7 +17,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { RoleBadge } from '@/components/role-badge'
 
-export type Tab = 'notes' | 'graph' | 'keys'
+export type Tab = 'notes' | 'graph' | 'health' | 'keys'
 
 const STORAGE_KEY = 'brain.tree.expanded'
 const DEFAULT_EXPANDED = ['vault', 'skills']
@@ -296,6 +297,7 @@ export function Sidebar({
   const navItems: { id: Tab; label: string; icon: typeof FileTextIcon }[] = [
     { id: 'notes', label: 'Notes', icon: FileTextIcon },
     { id: 'graph', label: 'Graph', icon: NetworkIcon },
+    { id: 'health', label: 'Health', icon: ActivityIcon },
     ...(me?.role === 'admin'
       ? [{ id: 'keys' as const, label: 'Keys', icon: KeyRoundIcon }]
       : []),

@@ -16,6 +16,7 @@ import { Toaster } from '@/components/ui/sonner'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Login } from '@/views/Login'
 import { NoteView } from '@/views/NoteView'
+import { HealthView } from '@/views/HealthView'
 import { KeysView } from '@/views/KeysView'
 
 // force-graph + d3 are heavy; only pull them in when the Graph tab is opened.
@@ -193,6 +194,7 @@ export default function App() {
               <GraphView data={graph} loading={graphLoading} onOpenNote={openNote} />
             </Suspense>
           )}
+          {tab === 'health' && <HealthView onOpenNote={openNote} onUnauthorized={signedOut} />}
           {tab === 'keys' && me?.role === 'admin' && <KeysView onUnauthorized={signedOut} />}
         </main>
       </div>

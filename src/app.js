@@ -12,6 +12,113 @@ async function sessionPrincipal(req, env) {
   return resolvePrincipal(env, m[1]);
 }
 
+// ---------------------------------------------------------------- hygiene report
+// Lives here (rather than in index.js) so index.js -> app.js stays a one-way import:
+// it is shared by the `check_brain` MCP tool, GET /app/api/check and the cron job.
+
+/** Whole days between a YYYY-MM-DD(THH:MM:SSZ) string and now. null when unparseable. */
+function daysAgo(dateStr) {
+  if (!dateStr) return null;
+  const t = Date.parse(String(dateStr).trim().slice(0, 10) + 'T00:00:00Z');
+  if (Number.isNaN(t)) return null;
+  return (Date.now() - t) / 86400000;
+}
+
+const UNSAVED_CAP = 25;
+const BROKEN_LINKS_CAP = 50;
+
+/**
+ * Vault hygiene snapshot, scoped to the principal's readable prefixes.
+ * Pass { role: 'admin', prefixes: [] } for the unscoped/cron view.
+ */
+export async function computeHygiene(env, p) {
+  const [notesRow, linksRow] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) AS c FROM notes').first(),
+    env.DB.prepare('SELECT COUNT(*) AS c FROM links').first(),
+  ]);
+
+  // ---- sessions: unsaved (no summary, older than a day) + activity in the last 7 days
+  const sessions = (
+    await env.DB.prepare(
+      `SELECT path, project, json_extract(frontmatter, '$.summary') AS summary,
+              COALESCE(json_extract(frontmatter, '$.date'), updated) AS date
+         FROM notes WHERE type = 'session'`
+    ).all()
+  ).results.filter((r) => allowed(p, r.path));
+
+  let sessions_7d = 0;
+  const unsaved = [];
+  for (const s of sessions) {
+    const age = daysAgo(s.date);
+    if (age !== null && age <= 7) sessions_7d++;
+    const summary = (s.summary == null ? '' : String(s.summary)).trim();
+    if (!summary && age !== null && age > 1) {
+      unsaved.push({ path: s.path, date: s.date || null, project: s.project || null });
+    }
+  }
+  unsaved.sort(
+    (a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.path).localeCompare(String(a.path))
+  );
+
+  // ---- active projects that have gone quiet
+  const projects = (
+    await env.DB.prepare("SELECT path, project, updated FROM notes WHERE type = 'project' AND status = 'active'").all()
+  ).results.filter((r) => allowed(p, r.path));
+  const stale_active_projects = projects
+    .filter((r) => {
+      const age = daysAgo(r.updated);
+      return age === null || age > 14; // missing/unparseable `updated:` counts as stale
+    })
+    .map((r) => ({
+      path: r.path,
+      project: r.project || r.path.split('/').pop().replace(/\.md$/, ''),
+      updated: r.updated || null,
+    }))
+    .sort((a, b) => String(a.updated || '').localeCompare(String(b.updated || '')));
+
+  // ---- decisions
+  let decisions_total = 0;
+  if (allowed(p, 'vault/logs/decisions.md')) {
+    const d = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first();
+    if (d?.body) decisions_total = (d.body.match(/### \[/g) || []).length;
+  }
+
+  // ---- broken wikilinks (resolved the same way the graph endpoint resolves them)
+  const allNotes = (await env.DB.prepare('SELECT path FROM notes').all()).results;
+  const byNoExt = new Map();
+  const byBase = new Map();
+  for (const n of allNotes) {
+    const ne = n.path.replace(/\.md$/, '');
+    byNoExt.set(ne, n.path);
+    const b = ne.split('/').pop();
+    if (!byBase.has(b)) byBase.set(b, n.path);
+  }
+  const links = (await env.DB.prepare('SELECT src, dst FROM links').all()).results;
+  const broken = [];
+  for (const l of links) {
+    const dst = String(l.dst || '');
+    if (!dst || dst.includes('#')) continue; // heading-only / in-note anchors aren't notes
+    if (!allowed(p, l.src)) continue;
+    const target = byNoExt.get(dst) || byNoExt.get(`vault/${dst}`) || byBase.get(dst.split('/').pop());
+    if (!target) broken.push({ src: l.src, dst });
+  }
+
+  return {
+    generated_at: new Date().toISOString(),
+    counts: {
+      notes: notesRow?.c ?? 0,
+      links: linksRow?.c ?? 0,
+      sessions_7d,
+      decisions_total,
+    },
+    unsaved_sessions: unsaved.slice(0, UNSAVED_CAP),
+    unsaved_total: unsaved.length,
+    stale_active_projects,
+    broken_links: broken.slice(0, BROKEN_LINKS_CAP),
+    broken_links_total: broken.length,
+  };
+}
+
 export async function handleApp(req, env, url) {
   if (!url.pathname.startsWith('/app')) return null;
 
@@ -91,6 +198,9 @@ export async function handleApp(req, env, url) {
         if (t && t !== l.src && visible.has(t)) edges.push({ source: l.src, target: t });
       }
       return Response.json({ nodes: notes.map((n) => ({ id: n.path, title: n.title, type: n.type || 'note' })), links: edges });
+    }
+    if (url.pathname === '/app/api/check') {
+      return Response.json(await computeHygiene(env, p));
     }
 
     // ---- key management (admin only)

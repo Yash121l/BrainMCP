@@ -23,8 +23,13 @@ graph, FTS5 chunks) in sync with the brain repo. Wipe it, reindex, identical res
 ## Tools
 `get_context` `search` `read_note` `list_notes` `backlinks` `links` —
 reads over the indexed brain (note paths look like `vault/projects/pulse.md`, `skills/<name>/SKILL.md`).
-`append_session_log` `log_decision` `update_note` `save_session` — write-back as real
-git commits to the brain repo. `list_skills` `get_skill` — serve the skills library.
+`save` — the whole end-of-session ritual (session log + decisions + topic notes +
+project `status`/`next` patch) in ONE atomic commit; prefer it over the granular
+fallbacks `append_session_log` `log_decision` `update_note` `save_session`, which
+also write back as real git commits. `check_brain` — hygiene report (unsaved sessions,
+stale active projects, broken wikilinks); same JSON at `GET /app/api/check`, snapshotted
+nightly into `meta.hygiene` and summarised in `/health`.
+`list_skills` `get_skill` — serve the skills library.
 
 ## Ops
 ```bash

@@ -28,6 +28,18 @@ export type ApiKey = {
   revoked: number
   last_used: string | null
 }
+export type UnsavedSession = { path: string; date: string; project: string }
+export type StaleProject = { path: string; project: string; updated: string }
+export type BrokenLink = { src: string; dst: string }
+export type HealthReport = {
+  generated_at: string
+  counts: { notes: number; links: number; sessions_7d: number; decisions_total: number }
+  unsaved_sessions: UnsavedSession[]
+  unsaved_total: number
+  stale_active_projects: StaleProject[]
+  broken_links: BrokenLink[]
+  broken_links_total: number
+}
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/app/api/${path}`, { credentials: 'same-origin', ...init })
@@ -64,6 +76,7 @@ export const api = {
     req<{ results: SearchHit[] }>(`search?q=${encodeURIComponent(q)}`, { signal }).then((d) => d.results),
   graph: () => req<GraphData>('graph'),
   keys: () => req<{ keys: ApiKey[] }>('keys').then((d) => d.keys),
+  check: () => req<HealthReport>('check'),
   createKey: (body: { name: string; role: Role; prefixes: string[]; expires_days: number | null }) =>
     req<{ id: string; key: string }>('keys', json(body)),
   revokeKey: (id: string) => req<{ ok: true }>('keys/revoke', json({ id })),

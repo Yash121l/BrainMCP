@@ -6,7 +6,7 @@ import { parseNote, isIndexable, normalizeProject } from './parse.js';
 import { getFile, putFile, appendFile, multiCommit, fetchRepoTar, tarEntries } from './github.js';
 import { handleOauth } from './oauth.js';
 import { resolvePrincipal, allowed, canWrite, isAdmin, createKey, listKeys, revokeKey } from './auth.js';
-import { handleApp } from './app.js';
+import { handleApp, computeHygiene } from './app.js';
 
 // ---------------------------------------------------------------- indexing
 
@@ -91,6 +91,88 @@ function ftsQuery(q) {
 
 async function upsertLocal(env, path, content) {
   if (isIndexable(path)) await upsertNotes(env, [parseNote(path, content)]);
+}
+
+// ------------------------------------------------- vault file composers (shared)
+
+const yamlStr = (s) => String(s ?? '').replace(/"/g, "'").replace(/\r?\n/g, ' ');
+
+/** Standard cloud session note. Same shape for append_session_log and save. */
+function sessionNote({ slug, summary, body, next_steps, surface, date, id }) {
+  return `---
+type: session
+project: ${slug ? `"[[projects/${slug}]]"` : '""'}
+date: ${date}
+started: ${new Date().toISOString()}
+summary: "${yamlStr(summary)}"
+duration:
+surface: ${surface}
+session_key: ${id}
+tags: [session, cloud]
+---
+
+# Cloud session ${date}
+
+## What happened
+${body}
+
+## Next steps
+${next_steps || '- (none)'}
+
+## Links
+- Project: ${slug ? `[[projects/${slug}]]` : '(none)'}
+`;
+}
+
+/** One append-only rich block for vault/logs/decisions.md. */
+function decisionBlock(decision, rationale, slug, date) {
+  const d = String(decision).trim();
+  const title = d.length > 90 ? d.slice(0, 90) + '…' : d;
+  return `\n### [${date}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${String(rationale || '').trim()}\n- **Project:** [[projects/${slug}]]\n`;
+}
+
+/** A topic note (full file — replaces any existing one). */
+function topicNote({ slug, title, content, date }) {
+  return `---
+type: topic
+title: "${yamlStr(title || slug)}"
+updated: ${date}
+tags: [topic]
+---
+
+${String(content || '').replace(/\n*$/, '\n')}`;
+}
+
+/**
+ * Patch a project note's frontmatter in place: status / next / updated.
+ * Returns the new text, or null if the note has no parseable frontmatter.
+ */
+function patchProjectNote(text, { status, next, date }) {
+  if (!text.startsWith('---')) return null;
+  const end = text.indexOf('\n---', 3);
+  if (end === -1) return null;
+  let fm = text.slice(0, end + 1); // "---\n<keys>\n"
+  const rest = text.slice(end + 1); // "---\n<body>"
+
+  // function replacements throughout: values are user text and may contain "$&"
+  const setLine = (block, key, line, valueRe) => {
+    if (valueRe && valueRe.test(block)) return block.replace(valueRe, () => line);
+    const plain = new RegExp(`^${key}:.*$`, 'm');
+    if (plain.test(block)) return block.replace(plain, () => line);
+    return block.replace(/\n$/, () => `\n${line}\n`);
+  };
+
+  if (status != null && String(status).trim()) {
+    fm = setLine(fm, 'status', `status: ${yamlStr(status).trim()}`, null);
+  }
+  if (next != null) {
+    // `next:` is a double-quoted scalar that may be huge and may wrap across lines.
+    // The value pattern allows \-escapes but never a bare " — so it cannot run past
+    // its own closing quote and swallow the keys below it.
+    fm = setLine(fm, 'next', `next: "${yamlStr(next)}"`, /^next:[ \t]*"(?:[^"\\]|\\[\s\S])*"[ \t]*$/m);
+  }
+  fm = setLine(fm, 'updated', `updated: ${date}`, null);
+  return fm + rest;
 }
 
 // ---------------------------------------------------------------- MCP tools
@@ -210,6 +292,51 @@ const TOOLS = [
     },
   },
   {
+    name: 'save',
+    description:
+      'THE end-of-session ritual, in ONE atomic git commit: session log + decisions + topic notes + project note status/next patch. Prefer this over calling append_session_log / log_decision / update_note separately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'project slug, e.g. "pulse"' },
+        summary: { type: 'string', description: 'one-line summary (session frontmatter)' },
+        body: { type: 'string', description: 'markdown: what happened this session' },
+        next_steps: { type: 'string', description: 'markdown list of next steps' },
+        surface: { type: 'string', description: 'where this ran: cowork / claude-web / codex-cloud / ...' },
+        decisions: {
+          type: 'array',
+          description: 'real decisions made this session; each is appended to vault/logs/decisions.md',
+          items: {
+            type: 'object',
+            properties: { decision: { type: 'string' }, rationale: { type: 'string' } },
+            required: ['decision', 'rationale'],
+          },
+        },
+        topics: {
+          type: 'array',
+          description: 'durable knowledge worth recalling later; writes vault/topics/<slug>.md (replaces the file if it exists)',
+          items: {
+            type: 'object',
+            properties: { slug: { type: 'string' }, title: { type: 'string' }, content: { type: 'string' } },
+            required: ['slug', 'content'],
+          },
+        },
+        project_update: {
+          type: 'object',
+          description: "patch the project note's frontmatter in place (updated: is always bumped)",
+          properties: { status: { type: 'string' }, next: { type: 'string' } },
+        },
+      },
+      required: ['project', 'summary', 'body'],
+    },
+  },
+  {
+    name: 'check_brain',
+    description:
+      'Vault hygiene report: index counts, sessions never saved (no summary), active projects gone stale (>14d), and broken [[wikilinks]]. Use to spot rot before/after a save.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'list_skills',
     description: 'List the skills library (skills/<name>/SKILL.md): name + description + which projects each is mapped to.',
     inputSchema: { type: 'object', properties: {} },
@@ -327,30 +454,10 @@ async function callTool(env, name, args = {}, p) {
       const slug = normalizeProject(args.project || '');
       const d = nowDate(); const t = nowTime(); const id = `cloud${randId(4)}`;
       const path = `vault/logs/sessions/${d}_${t}_${id}.md`;
-      const projLine = slug ? `"[[projects/${slug}]]"` : '""';
-      const content = `---
-type: session
-project: ${projLine}
-date: ${d}
-started: ${new Date().toISOString()}
-summary: "${(args.summary || '').replace(/"/g, "'")}"
-duration:
-surface: ${args.surface || 'cloud'}
-session_key: ${id}
-tags: [session, cloud]
----
-
-# Cloud session ${d}
-
-## What happened
-${args.body}
-
-## Next steps
-${args.next_steps || '- (none)'}
-
-## Links
-- Project: ${slug ? `[[projects/${slug}]]` : '(none)'}
-`;
+      const content = sessionNote({
+        slug, summary: args.summary || '', body: args.body, next_steps: args.next_steps,
+        surface: args.surface || 'cloud', date: d, id,
+      });
       if (!allowed(p, path)) return deny(`no write access to ${path} (key needs the vault/logs/ prefix)`);
       await putFile(env, path, content, `session(${args.surface || 'cloud'}): ${slug || 'general'} — ${(args.summary || '').slice(0, 60)}`);
       await upsertLocal(env, path, content);
@@ -362,8 +469,7 @@ ${args.next_steps || '- (none)'}
       if (!allowed(p, 'vault/logs/decisions.md')) return deny('no write access to vault/logs/decisions.md');
       const slug = normalizeProject(args.project);
       const d = args.decision.trim();
-      const title = d.length > 90 ? d.slice(0, 90) + '…' : d;
-      const block = `\n### [${nowDate()}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${args.rationale.trim()}\n- **Project:** [[projects/${slug}]]\n`;
+      const block = decisionBlock(d, args.rationale, slug, nowDate());
       const full = await appendFile(env, 'vault/logs/decisions.md', block, `decision(${slug}): ${d.slice(0, 60)}`);
       await upsertLocal(env, 'vault/logs/decisions.md', full);
       return { ok: true, appended: block.trim() };
@@ -387,6 +493,75 @@ ${args.next_steps || '- (none)'}
       for (const f of args.files) await upsertLocal(env, f.path, f.content);
       return { ok: true, commit: sha, files: args.files.map((f) => f.path) };
     }
+
+    case 'save': {
+      if (!canWrite(p)) return deny('key is read-only');
+      const slug = normalizeProject(args.project || '');
+      if (!slug) return { error: 'project (slug) is required' };
+      if (!args.summary || !args.body) return { error: 'summary and body are required' };
+
+      const date = nowDate();
+      const surface = args.surface || 'cloud';
+      const files = [];
+      const skipped = [];
+
+      // 1. session log — always written
+      const sessId = `cloud${randId(4)}`;
+      const sessPath = `vault/logs/sessions/${date}_${nowTime()}_${sessId}.md`;
+      if (!allowed(p, sessPath)) return deny(`no write access to ${sessPath}`);
+      files.push({
+        path: sessPath,
+        content: sessionNote({
+          slug, summary: args.summary, body: args.body, next_steps: args.next_steps,
+          surface, date, id: sessId,
+        }),
+      });
+
+      // 2. decisions — append rich blocks to the single append-only log
+      const decs = (Array.isArray(args.decisions) ? args.decisions : []).filter((x) => x && x.decision);
+      if (decs.length) {
+        const decPath = 'vault/logs/decisions.md';
+        if (!allowed(p, decPath)) return deny(`no write access to ${decPath}`);
+        const cur = await getFile(env, decPath);
+        let content = cur ? cur.content.replace(/\n*$/, '\n') : '';
+        for (const dec of decs) content += decisionBlock(dec.decision, dec.rationale, slug, date);
+        files.push({ path: decPath, content });
+      }
+
+      // 3. topic notes — full replace
+      const seenTopics = new Set();
+      for (const t of Array.isArray(args.topics) ? args.topics : []) {
+        const tslug = String(t?.slug || '').trim().replace(/^vault\//, '').replace(/^topics\//, '').replace(/\.md$/, '');
+        if (!tslug || seenTopics.has(tslug)) continue;
+        seenTopics.add(tslug);
+        const tPath = `vault/topics/${tslug}.md`;
+        if (!allowed(p, tPath)) return deny(`no write access to ${tPath}`);
+        files.push({ path: tPath, content: topicNote({ slug: tslug, title: t.title, content: t.content, date }) });
+      }
+
+      // 4. project note frontmatter patch
+      const pu = args.project_update;
+      if (pu && (pu.status != null || pu.next != null)) {
+        const projPath = `vault/projects/${slug}.md`;
+        if (!allowed(p, projPath)) return deny(`no write access to ${projPath}`);
+        const cur = await getFile(env, projPath);
+        if (!cur) {
+          skipped.push(`${projPath} — project note does not exist, not created`);
+        } else {
+          const patched = patchProjectNote(cur.content, { status: pu.status, next: pu.next, date });
+          if (!patched) skipped.push(`${projPath} — no YAML frontmatter to patch`);
+          else files.push({ path: projPath, content: patched });
+        }
+      }
+
+      const message = `save(${surface}): ${slug} — ${yamlStr(args.summary).slice(0, 72)}`;
+      const commit = await multiCommit(env, files, message);
+      for (const f of files) await upsertLocal(env, f.path, f.content);
+      return { ok: true, commit, files: files.map((f) => f.path), ...(skipped.length ? { skipped } : {}) };
+    }
+
+    case 'check_brain':
+      return computeHygiene(env, p);
 
     case 'list_skills': {
       const res = await env.DB.prepare(
@@ -485,7 +660,13 @@ export default {
     if (url.pathname === '/health') {
       const n = await env.DB.prepare('SELECT COUNT(*) AS c FROM notes').first().catch(() => ({ c: -1 }));
       const meta = await env.DB.prepare("SELECT v FROM meta WHERE k = 'last_full_reindex'").first().catch(() => null);
-      return Response.json({ ok: true, notes: n.c, last_full_reindex: meta?.v || null });
+      const hyg = await env.DB.prepare("SELECT v FROM meta WHERE k = 'hygiene'").first().catch(() => null);
+      let unsaved_sessions = null;
+      try {
+        const h = hyg?.v ? JSON.parse(hyg.v) : null;
+        if (h) unsaved_sessions = h.unsaved_total ?? h.unsaved_sessions?.length ?? null;
+      } catch { /* stale/corrupt snapshot — report null */ }
+      return Response.json({ ok: true, notes: n.c, last_full_reindex: meta?.v || null, unsaved_sessions });
     }
 
     if (url.pathname === '/webhook' && req.method === 'POST') {
@@ -552,6 +733,13 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(fullReindex(env).catch((e) => console.log('nightly reindex failed:', e.message)));
+    const work = async () => {
+      await fullReindex(env);
+      // hygiene snapshot over the whole brain (unscoped), surfaced by /health
+      const hygiene = await computeHygiene(env, { role: 'admin', prefixes: [] });
+      await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('hygiene', ?)")
+        .bind(JSON.stringify(hygiene)).run();
+    };
+    ctx.waitUntil(work().catch((e) => console.log('nightly reindex failed:', e.message)));
   },
 };

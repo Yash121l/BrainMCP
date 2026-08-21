@@ -12,6 +12,8 @@
     "run_worker_first": [
       "/mcp",
       "/webhook",
+      "/ingest/*",
+      "/hooks/*",
       "/admin/*",
       "/app",
       "/app/*",
@@ -36,6 +38,14 @@
       "binding": "DB",
       "database_name": "brain-index",
       "database_id": "25f6c237-b741-4a94-856b-4c82381ac93c"
+    }
+  ],
+  // Cold storage for tool-call telemetry. The nightly cron drains the D1
+  // tool_calls buffer into one object per session per day.
+  "r2_buckets": [
+    {
+      "binding": "LOGS",
+      "bucket_name": "brain-logs"
     }
   ],
   "triggers": {

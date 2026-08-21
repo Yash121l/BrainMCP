@@ -3,50 +3,15 @@
 // Streamable-HTTP MCP (JSON-RPC over POST /mcp), bearer-token auth, webhook ingest.
 
 import { parseNote, isIndexable, normalizeProject } from './parse.js';
+import { upsertNotes, deleteNotes, upsertLocal } from './indexer.js';
 import { getFile, putFile, appendFile, multiCommit, fetchRepoTar, tarEntries, encodeBase64 } from './github.js';
 import { handleOauth } from './oauth.js';
 import { resolvePrincipal, allowed, canWrite, isAdmin, createKey, listKeys, revokeKey } from './auth.js';
 import { handleApp, computeHygiene } from './app.js';
+import { skillCatalog, readSkillsConfig, skillsConfigEntries, skillsPayload } from './skills.js';
+import { hookInstaller, HOOK_VERSION } from './hook.js';
 
 // ---------------------------------------------------------------- indexing
-
-async function upsertNotes(env, parsed) {
-  const stmts = [];
-  for (const n of parsed) {
-    stmts.push(env.DB.prepare('DELETE FROM links WHERE src = ?').bind(n.path));
-    stmts.push(env.DB.prepare('DELETE FROM fts WHERE path = ?').bind(n.path));
-    stmts.push(
-      env.DB.prepare(
-        `INSERT OR REPLACE INTO notes (path, title, type, project, status, tags, frontmatter, body, updated, indexed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
-      ).bind(n.path, n.title, n.type, n.project, n.status, n.tags, n.frontmatter, n.body, n.updated)
-    );
-    for (const dst of n.links) {
-      stmts.push(env.DB.prepare('INSERT OR REPLACE INTO links (src, dst) VALUES (?, ?)').bind(n.path, dst));
-    }
-    for (const c of n.chunks) {
-      stmts.push(
-        env.DB.prepare('INSERT INTO fts (path, title, heading, text) VALUES (?, ?, ?, ?)').bind(
-          n.path, n.title, c.heading, c.text
-        )
-      );
-    }
-  }
-  // D1 batch caps: send in slices to stay well under statement limits
-  for (let i = 0; i < stmts.length; i += 90) {
-    await env.DB.batch(stmts.slice(i, i + 90));
-  }
-}
-
-async function deleteNotes(env, paths) {
-  const stmts = [];
-  for (const p of paths) {
-    stmts.push(env.DB.prepare('DELETE FROM notes WHERE path = ?').bind(p));
-    stmts.push(env.DB.prepare('DELETE FROM links WHERE src = ?').bind(p));
-    stmts.push(env.DB.prepare('DELETE FROM fts WHERE path = ?').bind(p));
-  }
-  if (stmts.length) await env.DB.batch(stmts);
-}
 
 async function indexFromGitHub(env, paths) {
   const parsed = [];
@@ -80,6 +45,9 @@ const nowDate = () => new Date().toISOString().slice(0, 10);
 const nowTime = () => new Date().toISOString().slice(11, 19).replace(/:/g, '');
 const randId = (n = 4) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join('');
 
+/** Sanitize a client-supplied session id down to something safe in a filename. */
+const sessionKey = (v) => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+
 function ftsQuery(q) {
   // sanitize to phrase-per-token to avoid FTS5 syntax errors on user input
   return q
@@ -87,10 +55,6 @@ function ftsQuery(q) {
     .filter(Boolean)
     .map((t) => `"${t.replace(/"/g, '""')}"`)
     .join(' ');
-}
-
-async function upsertLocal(env, path, content) {
-  if (isIndexable(path)) await upsertNotes(env, [parseNote(path, content)]);
 }
 
 // ------------------------------------------------- vault file composers (shared)
@@ -128,7 +92,8 @@ ${next_steps || '- (none)'}
 function decisionBlock(decision, rationale, slug, date) {
   const d = String(decision).trim();
   const title = d.length > 90 ? d.slice(0, 90) + '…' : d;
-  return `\n### [${date}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${String(rationale || '').trim()}\n- **Project:** [[projects/${slug}]]\n`;
+  const project = slug ? `[[projects/${slug}]]` : '(none)';
+  return `\n### [${date}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${String(rationale || '').trim()}\n- **Project:** ${project}\n`;
 }
 
 /** A topic note (full file — replaces any existing one). */
@@ -177,14 +142,32 @@ function patchProjectNote(text, { status, next, date }) {
 
 // ---------------------------------------------------------------- MCP tools
 
+// Returned from `initialize`, so every client (Claude Code, claude.ai connectors,
+// Codex) injects it into system context. This is the device-independent
+// replacement for the old machine-local SessionStart hook.
+const INSTRUCTIONS = `ClaudeBrain: the user's persistent second brain (projects, topics, decisions, sessions, and a skills library), backed by a git repo and served through these tools.
+
+At the START of every session, call get_context once. Pass the project slug if you can infer one from the working directory or the user's request; pass client_session_id when your client exposes a session id. Its response is authoritative for this session: binding_rules are mandatory, skills.must_load bodies apply without being asked, and skills.on_demand names must be fetched with get_skill before you do work they govern.
+
+At the END of a session, or whenever the user says "save", call save once with the session_id get_context returned. It commits the session log, decisions, topic notes, and the project's status/next patch atomically. Then call check_brain and fix anything it flags that your session caused.
+
+Rules: read the brain before answering questions about past work; never invent a project note for throwaway tasks; prefer [[wikilinks]] over copying content between notes; keep credentials and CRM/PII data out of notes.`;
+
 const TOOLS = [
   {
     name: 'get_context',
     description:
-      'Session bootstrap: NOW.md, active projects table, and — when a project slug is given — that project\'s BINDING rules file in full, its project note, recent decisions and sessions. Call this first in any cloud session.',
+      'Session bootstrap. Returns a session_id to pass to save, the always-on skills for this project (must-load bodies in full, the rest by name), the active projects table, and — when a project slug is given — that project\'s BINDING rules file in full, its project note, recent decisions and sessions. Call this ONCE at the start of every session, on every surface.',
     inputSchema: {
       type: 'object',
-      properties: { project: { type: 'string', description: 'project slug, e.g. "pulse"' } },
+      properties: {
+        project: { type: 'string', description: 'project slug, e.g. "pulse"' },
+        client_session_id: {
+          type: 'string',
+          description:
+            "your client's own session id, when it exposes one. Adopted as the session_id so tool-call telemetry from this machine links to the session note.",
+        },
+      },
     },
   },
   {
@@ -198,6 +181,11 @@ const TOOLS = [
         project: { type: 'string' },
         folder: { type: 'string', description: 'path prefix, e.g. "vault/topics/"' },
         limit: { type: 'number', default: 10 },
+        include_logs: {
+          type: 'boolean',
+          description:
+            'include session logs and activity mirrors. Off by default: they are the bulk of the vault and drown out knowledge notes.',
+        },
       },
       required: ['q'],
     },
@@ -298,7 +286,15 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: 'project slug, e.g. "pulse"' },
+        session_id: {
+          type: 'string',
+          description:
+            'the session_id get_context returned. Makes save idempotent: calling it again updates the same session note instead of creating a second one.',
+        },
+        project: {
+          type: 'string',
+          description: 'project slug, e.g. "pulse". Omit for work that belongs to no project; it lands under "general".',
+        },
         summary: { type: 'string', description: 'one-line summary (session frontmatter)' },
         body: { type: 'string', description: 'markdown: what happened this session' },
         next_steps: { type: 'string', description: 'markdown list of next steps' },
@@ -327,7 +323,7 @@ const TOOLS = [
           properties: { status: { type: 'string' }, next: { type: 'string' } },
         },
       },
-      required: ['project', 'summary', 'body'],
+      required: ['summary', 'body'],
     },
   },
   {
@@ -354,10 +350,8 @@ async function callTool(env, name, args = {}, p) {
     case 'get_context': {
       const slug = normalizeProject(args.project || '');
       const out = {};
-      const now = allowed(p, 'vault/_activity/NOW.md')
-        ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/_activity/NOW.md').first()
-        : null;
-      out.now = now?.body || null;
+      out.session_id = sessionKey(args.client_session_id) || `srv${randId(6)}`;
+      out.skills = await skillsPayload(env, p, slug);
       const active = await env.DB.prepare(
         "SELECT path, project, status, updated, json_extract(frontmatter, '$.next') AS next FROM notes WHERE type = 'project' AND status = 'active' ORDER BY updated DESC"
       ).all();
@@ -387,7 +381,9 @@ async function callTool(env, name, args = {}, p) {
         if (dec) out.recent_decisions = dec.body.split(/\n(?=### \[)/)
           .filter((b) => b.startsWith('### [')).slice(-10).map((b) => b.trim().slice(0, 500));
       }
-      out.hint = 'Binding rules above are MANDATORY for this project. Write back at session end via append_session_log or save_session.';
+      out.hint =
+        'Binding rules above are MANDATORY for this project. At session end call save with this session_id — '
+        + 'calling it twice updates one note rather than creating two.';
       return out;
     }
 
@@ -399,6 +395,11 @@ async function callTool(env, name, args = {}, p) {
       if (args.type) { sql += ' AND n.type = ?'; binds.push(args.type); }
       if (args.project) { sql += ' AND n.project = ?'; binds.push(normalizeProject(args.project)); }
       if (args.folder) { sql += ' AND f.path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
+      // Session logs and activity mirrors are ~80% of the vault. They swamp
+      // knowledge notes in FTS ranking, so they are opt-in.
+      if (!args.include_logs && !args.type && !args.folder) {
+        sql += " AND n.type != 'session' AND f.path NOT LIKE 'vault/logs/activity/%'";
+      }
       sql += ' ORDER BY rank LIMIT ?';
       binds.push(limit * 3); // over-fetch; scope filter may drop rows
       const res = await env.DB.prepare(sql).bind(...binds).all();
@@ -496,8 +497,7 @@ async function callTool(env, name, args = {}, p) {
 
     case 'save': {
       if (!canWrite(p)) return deny('key is read-only');
-      const slug = normalizeProject(args.project || '');
-      if (!slug) return { error: 'project (slug) is required' };
+      const slug = normalizeProject(args.project || '') || 'general';
       if (!args.summary || !args.body) return { error: 'summary and body are required' };
 
       const date = nowDate();
@@ -505,14 +505,19 @@ async function callTool(env, name, args = {}, p) {
       const files = [];
       const skipped = [];
 
-      // 1. session log — always written
-      const sessId = `cloud${randId(4)}`;
-      const sessPath = `vault/logs/sessions/${date}_${nowTime()}_${sessId}.md`;
+      // 1. session log — always written. When the caller passes back the
+      // session_id from get_context we update that note in place, so saving
+      // twice in one session yields one note, not two.
+      const sessId = sessionKey(args.session_id) || `cloud${randId(4)}`;
+      const prior = await env.DB.prepare(
+        "SELECT path FROM notes WHERE type = 'session' AND json_extract(frontmatter, '$.session_key') = ? ORDER BY path LIMIT 1"
+      ).bind(sessId).first();
+      const sessPath = prior?.path || `vault/logs/sessions/${date}_${nowTime()}_${sessId}.md`;
       if (!allowed(p, sessPath)) return deny(`no write access to ${sessPath}`);
       files.push({
         path: sessPath,
         content: sessionNote({
-          slug, summary: args.summary, body: args.body, next_steps: args.next_steps,
+          slug: args.project ? slug : '', summary: args.summary, body: args.body, next_steps: args.next_steps,
           surface, date, id: sessId,
         }),
       });
@@ -524,7 +529,7 @@ async function callTool(env, name, args = {}, p) {
         if (!allowed(p, decPath)) return deny(`no write access to ${decPath}`);
         const cur = await getFile(env, decPath);
         let content = cur ? cur.content.replace(/\n*$/, '\n') : '';
-        for (const dec of decs) content += decisionBlock(dec.decision, dec.rationale, slug, date);
+        for (const dec of decs) content += decisionBlock(dec.decision, dec.rationale, args.project ? slug : '', date);
         files.push({ path: decPath, content });
       }
 
@@ -541,7 +546,9 @@ async function callTool(env, name, args = {}, p) {
 
       // 4. project note frontmatter patch
       const pu = args.project_update;
-      if (pu && (pu.status != null || pu.next != null)) {
+      if (pu && !args.project) {
+        skipped.push('project_update ignored — no project given, so there is no project note to patch');
+      } else if (pu && (pu.status != null || pu.next != null)) {
         const projPath = `vault/projects/${slug}.md`;
         if (!allowed(p, projPath)) return deny(`no write access to ${projPath}`);
         const cur = await getFile(env, projPath);
@@ -564,11 +571,8 @@ async function callTool(env, name, args = {}, p) {
       return computeHygiene(env, p);
 
     case 'list_skills': {
-      const res = await env.DB.prepare(
-        "SELECT path, json_extract(frontmatter, '$.name') AS name, json_extract(frontmatter, '$.description') AS description FROM notes WHERE path LIKE 'skills/%/SKILL.md' ORDER BY path"
-      ).all();
-      const mappings = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('skills/mappings.md').first();
-      return { skills: res.results.filter((r) => allowed(p, r.path)), mappings: 'skills/mappings.yaml in repo Yash121l/brain' };
+      const [skills, configText] = await Promise.all([skillCatalog(env, p), readSkillsConfig(env)]);
+      return { skills, mappings: skillsConfigEntries(configText).entries };
     }
 
     case 'get_skill': {
@@ -599,7 +603,8 @@ async function handleRpc(env, msg, principal) {
       return rpcResult(id, {
         protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : '2025-06-18',
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'brain-mcp', title: 'ClaudeBrain Vault', version: '1.0.0' },
+        serverInfo: { name: 'brain-mcp', title: 'ClaudeBrain Vault', version: '2.0.0' },
+        instructions: INSTRUCTIONS,
       });
     case 'ping':
       return rpcResult(id, {});
@@ -630,6 +635,67 @@ async function handleRpc(env, msg, principal) {
 async function getPrincipal(req, env) {
   const h = req.headers.get('Authorization') || '';
   return resolvePrincipal(env, h.replace(/^Bearer\s+/i, ''));
+}
+
+// ---------------------------------------------------------------- telemetry
+
+const INGEST_BATCH_CAP = 500;
+const INGEST_PAYLOAD_CAP = 8000;
+
+/** Buffer a batch of redacted tool-call records into D1. */
+async function ingestToolCalls(env, records) {
+  const capped = records.slice(0, INGEST_BATCH_CAP);
+  const stmts = capped.map((r) => {
+    const ts = String(r?.ts || new Date().toISOString());
+    const day = /^\d{4}-\d{2}-\d{2}/.test(ts) ? ts.slice(0, 10) : nowDate();
+    return env.DB.prepare(
+      'INSERT INTO tool_calls (session, day, ts, surface, cwd, project, tool, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      sessionKey(r?.session) || 'unknown',
+      day,
+      ts.slice(0, 40),
+      String(r?.surface || '').slice(0, 40),
+      String(r?.cwd || '').slice(0, 300),
+      normalizeProject(String(r?.project || '')).slice(0, 64),
+      String(r?.tool || '').slice(0, 64),
+      JSON.stringify(r).slice(0, INGEST_PAYLOAD_CAP)
+    );
+  });
+  for (let i = 0; i < stmts.length; i += 90) await env.DB.batch(stmts.slice(i, i + 90));
+  return { ingested: capped.length, dropped: records.length - capped.length };
+}
+
+/**
+ * Drain every completed day out of the D1 buffer into R2, one object per
+ * session per day. Runs on the nightly cron; safe to run by hand.
+ */
+async function rollUpToolCalls(env) {
+  if (!env.LOGS) return { skipped: 'no R2 binding' };
+  const today = nowDate();
+  const rows = (
+    await env.DB.prepare('SELECT session, day, payload FROM tool_calls WHERE day < ? ORDER BY day, session, id')
+      .bind(today).all()
+  ).results;
+  if (!rows.length) return { rolled: 0, objects: 0 };
+
+  const groups = new Map();
+  for (const r of rows) {
+    const k = `${r.day}/${r.session}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r.payload);
+  }
+  for (const [k, lines] of groups) {
+    const key = `tool-calls/${k}.jsonl`;
+    // R2 has no append; a session that spanned a roll-up boundary already has
+    // an object, so read it back and rewrite. These are tens of KB.
+    const prev = await env.LOGS.get(key);
+    const head = prev ? (await prev.text()).replace(/\n*$/, '\n') : '';
+    await env.LOGS.put(key, `${head}${lines.join('\n')}\n`, {
+      httpMetadata: { contentType: 'application/x-ndjson' },
+    });
+  }
+  await env.DB.prepare('DELETE FROM tool_calls WHERE day < ?').bind(today).run();
+  return { rolled: rows.length, objects: groups.size };
 }
 
 async function verifyWebhook(req, env, rawBody) {
@@ -666,7 +732,16 @@ export default {
         const h = hyg?.v ? JSON.parse(hyg.v) : null;
         if (h) unsaved_sessions = h.unsaved_total ?? h.unsaved_sessions?.length ?? null;
       } catch { /* stale/corrupt snapshot — report null */ }
-      return Response.json({ ok: true, notes: n.c, last_full_reindex: meta?.v || null, unsaved_sessions });
+      const rollup = await env.DB.prepare("SELECT v FROM meta WHERE k = 'last_rollup'").first().catch(() => null);
+      const buffered = await env.DB.prepare('SELECT COUNT(*) AS c FROM tool_calls').first().catch(() => ({ c: -1 }));
+      return Response.json({
+        ok: true,
+        notes: n.c,
+        last_full_reindex: meta?.v || null,
+        unsaved_sessions,
+        hook_version: HOOK_VERSION,
+        telemetry: { buffered: buffered.c, last_rollup: rollup?.v ? JSON.parse(rollup.v) : null },
+      });
     }
 
     if (url.pathname === '/webhook' && req.method === 'POST') {
@@ -734,6 +809,45 @@ export default {
       }
     }
 
+    // Tool-call telemetry from the PostToolUse hook. Records arrive already
+    // redacted by the hook; this is a buffer, not a scrubber.
+    if (url.pathname === '/ingest/tool-calls' && req.method === 'POST') {
+      const p = await getPrincipal(req, env);
+      if (!p) return new Response('unauthorized', { status: 401 });
+      if (!canWrite(p)) return Response.json({ error: 'key is read-only' }, { status: 403 });
+      const body = await req.json().catch(() => null);
+      const records = Array.isArray(body?.records) ? body.records : null;
+      if (!records) return Response.json({ error: 'records[] required' }, { status: 400 });
+      try {
+        return Response.json({ ok: true, ...(await ingestToolCalls(env, records)) });
+      } catch (e) {
+        return Response.json({ ok: false, error: e.message }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/admin/rollup' && req.method === 'POST') {
+      const p = await getPrincipal(req, env);
+      if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
+      try {
+        return Response.json({ ok: true, ...(await rollUpToolCalls(env)) });
+      } catch (e) {
+        return Response.json({ ok: false, error: e.message }, { status: 500 });
+      }
+    }
+
+    // The one hook a machine still needs: PostToolUse telemetry.
+    //   curl -fsSL -H "Authorization: Bearer $KEY" https://<host>/hooks/install.sh | BRAIN_KEY=$KEY sh
+    if (url.pathname === '/hooks/install.sh' && req.method === 'GET') {
+      const p = await getPrincipal(req, env);
+      if (!p) return new Response('unauthorized', { status: 401 });
+      return new Response(hookInstaller(url.origin), {
+        headers: {
+          'Content-Type': 'text/x-shellscript; charset=utf-8',
+          'X-Brain-Hook-Version': HOOK_VERSION,
+        },
+      });
+    }
+
     if (url.pathname === '/admin/reindex' && req.method === 'POST') {
       const p = await getPrincipal(req, env);
       if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
@@ -768,7 +882,7 @@ export default {
       return Response.json(Array.isArray(body) ? replies : replies[0]);
     }
 
-    return new Response('BrainMCP. Endpoints: POST /mcp, POST /webhook, POST /admin/reindex, GET /health, GET /skills/install.sh', { status: 404 });
+    return new Response('BrainMCP. Endpoints: POST /mcp, POST /webhook, POST /ingest/tool-calls, POST /admin/reindex, POST /admin/rollup, GET /health, GET /skills/install.sh, GET /hooks/install.sh', { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
@@ -778,6 +892,15 @@ export default {
       const hygiene = await computeHygiene(env, { role: 'admin', prefixes: [] });
       await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('hygiene', ?)")
         .bind(JSON.stringify(hygiene)).run();
+      // telemetry: drain completed days out of D1 into R2. Isolated so a
+      // failure here never costs us the reindex above.
+      try {
+        const r = await rollUpToolCalls(env);
+        await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_rollup', ?)")
+          .bind(JSON.stringify({ at: new Date().toISOString(), ...r })).run();
+      } catch (e) {
+        console.log('tool-call rollup failed:', e.message);
+      }
     };
     ctx.waitUntil(work().catch((e) => console.log('nightly reindex failed:', e.message)));
   },

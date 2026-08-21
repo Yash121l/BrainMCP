@@ -66,3 +66,20 @@ CREATE TABLE IF NOT EXISTS api_keys (
   revoked   INTEGER DEFAULT 0,
   last_used TEXT
 );
+
+-- Tool-call telemetry. Hooks POST redacted records to /ingest/tool-calls; the
+-- nightly cron rolls every completed day into one R2 object per session and
+-- deletes the rows. Hot in D1 for a day, cheap in R2 after.
+CREATE TABLE IF NOT EXISTS tool_calls (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  session TEXT NOT NULL,
+  day     TEXT NOT NULL,   -- YYYY-MM-DD, taken from the record's own ts
+  ts      TEXT NOT NULL,
+  surface TEXT,
+  cwd     TEXT,
+  project TEXT,
+  tool    TEXT,
+  payload TEXT             -- the full redacted record as JSON
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_day     ON tool_calls (day);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls (session, id);

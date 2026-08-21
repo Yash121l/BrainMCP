@@ -28,6 +28,16 @@ export type ApiKey = {
   revoked: number
   last_used: string | null
 }
+export type CatalogSkill = { name: string; description: string }
+export type SkillRef = { name: string; must: boolean }
+export type SkillEntry = { project: string; skills: SkillRef[] }
+export type SkillsConfig = {
+  catalog: CatalogSkill[]
+  entries: SkillEntry[]
+  inherits_default: string[]
+  editable: boolean
+}
+export type SkillEntryInput = { project: string; inherits_default: boolean; skills: SkillRef[] }
 export type UnsavedSession = { path: string; date: string; project: string }
 export type StaleProject = { path: string; project: string; updated: string }
 export type BrokenLink = { src: string; dst: string }
@@ -60,8 +70,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
-const json = (body: unknown): RequestInit => ({
-  method: 'POST',
+const json = (body: unknown, method = 'POST'): RequestInit => ({
+  method,
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(body),
 })
@@ -77,6 +87,9 @@ export const api = {
   graph: () => req<GraphData>('graph'),
   keys: () => req<{ keys: ApiKey[] }>('keys').then((d) => d.keys),
   check: () => req<HealthReport>('check'),
+  skills: () => req<SkillsConfig>('skills'),
+  saveSkills: (entries: SkillEntryInput[]) =>
+    req<{ ok: true; commit: string }>('skills', json({ entries }, 'PUT')),
   createKey: (body: { name: string; role: Role; prefixes: string[]; expires_days: number | null }) =>
     req<{ id: string; key: string }>('keys', json(body)),
   revokeKey: (id: string) => req<{ ok: true }>('keys/revoke', json({ id })),

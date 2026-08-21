@@ -4,7 +4,10 @@
 // search, graph, backlinks and (admin only) key management. Notes are read-only
 // here — writes go through git/MCP.
 
-import { resolvePrincipal, allowed, isAdmin, createKey, listKeys, revokeKey, sha256hex, randToken } from './auth.js';
+import { resolvePrincipal, allowed, isAdmin, canWrite, createKey, listKeys, revokeKey, sha256hex, randToken } from './auth.js';
+import { getFile, putFile } from './github.js';
+import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig } from './skills.js';
+import { upsertLocal } from './indexer.js';
 
 async function sessionPrincipal(req, env) {
   const m = (req.headers.get('Cookie') || '').match(/brain_session=([^;]+)/);
@@ -201,6 +204,37 @@ export async function handleApp(req, env, url) {
     }
     if (url.pathname === '/app/api/check') {
       return Response.json(await computeHygiene(env, p));
+    }
+
+    // ---- always-on skills: which skills bind to which project (vault/skills.md)
+    const SKILLS_PATH = 'vault/skills.md';
+
+    if (url.pathname === '/app/api/skills' && req.method === 'GET') {
+      const [catalog, configText] = await Promise.all([skillCatalog(env, p), readSkillsConfig(env)]);
+      const { entries } = skillsConfigEntries(configText);
+      return Response.json({
+        catalog,
+        entries,
+        inherits_default: entries.filter((e) => e.inherits_default).map((e) => e.project),
+        editable: canWrite(p) && allowed(p, SKILLS_PATH),
+      });
+    }
+
+    if (url.pathname === '/app/api/skills' && req.method === 'PUT') {
+      if (!canWrite(p) || !allowed(p, SKILLS_PATH)) {
+        return Response.json({ error: 'no write access to vault/skills.md' }, { status: 403 });
+      }
+      const body = await req.json().catch(() => ({}));
+      if (!Array.isArray(body.entries)) return Response.json({ error: 'entries[] required' }, { status: 400 });
+      if (!body.entries.some((e) => e?.project === 'default')) {
+        return Response.json({ error: 'a "default" row is required — it is the fallback for every session' }, { status: 400 });
+      }
+      const existing = await getFile(env, SKILLS_PATH);
+      const { header } = skillsConfigEntries(existing?.content || '');
+      const content = renderSkillsConfig(header, body.entries);
+      const sha = await putFile(env, SKILLS_PATH, content, 'skills: update project mappings (web UI)', existing?.sha);
+      await upsertLocal(env, SKILLS_PATH, content);
+      return Response.json({ ok: true, commit: sha });
     }
 
     // ---- key management (admin only)

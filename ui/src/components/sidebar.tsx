@@ -6,6 +6,7 @@ import {
   KeyRoundIcon,
   NetworkIcon,
   SearchIcon,
+  SparklesIcon,
 } from 'lucide-react'
 
 import type { Me, NoteMeta } from '@/lib/api'
@@ -17,7 +18,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { RoleBadge } from '@/components/role-badge'
 
-export type Tab = 'notes' | 'graph' | 'health' | 'keys'
+export type Tab = 'notes' | 'graph' | 'health' | 'skills' | 'keys'
 
 const STORAGE_KEY = 'brain.tree.expanded'
 const DEFAULT_EXPANDED = ['vault', 'skills']
@@ -298,6 +299,7 @@ export function Sidebar({
     { id: 'notes', label: 'Notes', icon: FileTextIcon },
     { id: 'graph', label: 'Graph', icon: NetworkIcon },
     { id: 'health', label: 'Health', icon: ActivityIcon },
+    { id: 'skills', label: 'Skills', icon: SparklesIcon },
     ...(me?.role === 'admin'
       ? [{ id: 'keys' as const, label: 'Keys', icon: KeyRoundIcon }]
       : []),

@@ -698,6 +698,14 @@ async function rollUpToolCalls(env) {
   return { rolled: rows.length, objects: groups.size };
 }
 
+/** Roll up and stamp the result, so /health reports the last drain either way. */
+async function recordRollup(env) {
+  const r = await rollUpToolCalls(env);
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_rollup', ?)")
+    .bind(JSON.stringify({ at: new Date().toISOString(), ...r })).run();
+  return r;
+}
+
 async function verifyWebhook(req, env, rawBody) {
   const sig = req.headers.get('X-Hub-Signature-256') || '';
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -829,7 +837,8 @@ export default {
       const p = await getPrincipal(req, env);
       if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
       try {
-        return Response.json({ ok: true, ...(await rollUpToolCalls(env)) });
+        const r = await recordRollup(env);
+        return Response.json({ ok: true, ...r });
       } catch (e) {
         return Response.json({ ok: false, error: e.message }, { status: 500 });
       }
@@ -895,9 +904,7 @@ export default {
       // telemetry: drain completed days out of D1 into R2. Isolated so a
       // failure here never costs us the reindex above.
       try {
-        const r = await rollUpToolCalls(env);
-        await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_rollup', ?)")
-          .bind(JSON.stringify({ at: new Date().toISOString(), ...r })).run();
+        await recordRollup(env);
       } catch (e) {
         console.log('tool-call rollup failed:', e.message);
       }

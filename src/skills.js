@@ -106,12 +106,13 @@ export function renderSkillsConfig(header, entries) {
 /** The skills library as { name, description } rows, scoped to the principal. */
 export async function skillCatalog(env, p) {
   const res = await env.DB.prepare(
-    `SELECT path, json_extract(frontmatter, '$.name') AS name, json_extract(frontmatter, '$.description') AS description
+    `SELECT path, json_extract(frontmatter, '$.name') AS name, json_extract(frontmatter, '$.description') AS description,
+            LENGTH(CAST(body AS BLOB)) AS bytes
        FROM notes WHERE path LIKE 'skills/%/SKILL.md' ORDER BY path`
   ).all();
   return res.results
     .filter((r) => allowed(p, r.path))
-    .map((r) => ({ name: r.name || r.path.split('/')[1], description: r.description || '' }));
+    .map((r) => ({ name: r.name || r.path.split('/')[1], description: r.description || '', bytes: r.bytes || 0 }));
 }
 
 /** Read skills.md from the index, falling back to GitHub when it is not indexed yet. */

@@ -28,7 +28,7 @@ export type ApiKey = {
   revoked: number
   last_used: string | null
 }
-export type CatalogSkill = { name: string; description: string }
+export type CatalogSkill = { name: string; description: string; bytes?: number }
 export type SkillRef = { name: string; must: boolean }
 export type SkillEntry = { project: string; skills: SkillRef[] }
 export type SkillsConfig = {

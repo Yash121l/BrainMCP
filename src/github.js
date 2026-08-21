@@ -154,7 +154,7 @@ export function* tarEntries(buf) {
   }
 }
 
-function encodeBase64(str) {
+export function encodeBase64(str) {
   const bytes = new TextEncoder().encode(str);
   let bin = '';
   const CHUNK = 0x8000;

@@ -19,7 +19,8 @@
       "/token",
       "/register",
       "/.well-known/*",
-      "/health"
+      "/health",
+      "/skills/*"
     ]
   },
   // brain.yashlunawat.com is attached as a Workers custom domain in the dashboard.

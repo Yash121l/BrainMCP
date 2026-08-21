@@ -41,5 +41,5 @@ Secrets (`npx wrangler secret put`): `BRAIN_TOKEN` (MCP bearer), `GITHUB_TOKEN`
 (fine-grained PAT, Contents R/W on `Yash121l/brain` only), `WEBHOOK_SECRET` (HMAC).
 Local credentials copy: `~/.config/brain-mcp/credentials`.
 
-Endpoints: `GET /` (web UI), `POST /mcp`, `POST /webhook`, `POST /admin/reindex`, `GET /health`.
+Endpoints: `GET /` (web UI), `POST /mcp`, `POST /webhook`, `POST /admin/reindex`, `GET /health`, `GET /skills/install.sh` (self-extracting skills installer for any machine: `curl -fsSL -H "Authorization: Bearer $KEY" https://brain.yashlunawat.com/skills/install.sh | sh`).
 Connection guide for every surface: `docs/CONNECT.md` in the brain repo.

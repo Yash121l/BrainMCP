@@ -31,14 +31,10 @@ jobs:
       - name: Build UI
         run: npm run build --prefix ui
 
-      # schema.sql is all CREATE ... IF NOT EXISTS, so this is idempotent. It runs
-      # before the deploy so a worker never ships ahead of the tables it queries.
-      - name: Apply D1 schema
-        run: npx wrangler d1 execute brain-index --remote --file=schema.sql
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
+      # No migration step: the CI token has Workers and R2 but not D1 Edit, so
+      # `wrangler d1 execute --remote` 401s here. Until that permission is added,
+      # apply schema.sql by hand before merging a schema change:
+      #   npx wrangler d1 execute brain-index --remote --file=schema.sql
       - name: Deploy worker
         run: npx wrangler deploy
         env:

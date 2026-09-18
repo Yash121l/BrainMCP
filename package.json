@@ -7,7 +7,8 @@
     "ui:dev": "npm --prefix ui run dev",
     "deploy": "npm run ui:build && wrangler deploy",
     "dev": "wrangler dev",
-    "seed": "node scripts/build-seed.mjs && bash scripts/apply-seed.sh"
+    "seed": "node scripts/build-seed.mjs && bash scripts/apply-seed.sh",
+    "seed:local": "node scripts/build-seed.mjs && bash scripts/apply-seed.sh --local"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

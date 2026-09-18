@@ -49,15 +49,36 @@ The script prints the new URL and a checklist of the places that reference it
 and `~/.codex/config.toml` on each machine; the claude.ai connector).
 
 ## Access keys
-Keys live in D1 (`api_keys`), managed in the web UI (`<url>` → Keys tab, admin only).
-They do NOT migrate across accounts — mint fresh ones after moving.
-- role: `read` | `write` | `admin`; prefixes: path scopes (`[]` = everything)
-- a collaborator key for one project: role `write`, prefixes
-  `vault/projects/<slug>.md, vault/rules/<slug>.md, vault/topics/, vault/logs/`
+Keys live in D1 (`api_keys`), managed in the web UI (`<url>` → Keys tab, admin only):
+one key per person or machine, a role, and a scope. They do NOT migrate across
+accounts — mint fresh ones after moving.
+- role: `read` | `write` | `admin`
+- scope: empty = the whole brain, otherwise any mix of path prefixes (`vault/logs/`)
+  and project scopes (`project:<slug>`). A project scope resolves on every request to
+  the project note plus every note filed under that project, so notes written later
+  are covered without re-issuing the key.
+- **Grant access** mints the key and hands back the three things the person needs:
+  the key for web sign-in, the `claude mcp add` line, and the skills installer.
+- **Edit** re-scopes a key in place (role, scope, expiry) and takes effect on that
+  person's live web session and connector tokens immediately — narrowing access no
+  longer means handing out a new secret.
+- a writer also needs the folder new files land in (`vault/logs/` for sessions and
+  decisions); a project scope alone only covers notes that already exist
 - a machine key for telemetry needs `write` (the ingest endpoint rejects read-only keys)
 - revoking a key also kills every web session and claude.ai connector token minted from it
 - `BRAIN_TOKEN` (worker secret) is break-glass admin only — rotate freely:
   `openssl rand -hex 32 | npx wrangler secret put BRAIN_TOKEN` (update `~/.config/brain-mcp/credentials`)
+
+## Running it locally
+```bash
+npm install && npm run ui:build
+printf 'BRAIN_TOKEN=local-dev-only\n' > .dev.vars
+BRAIN_DIR=~/obsidian/brain npm run seed:local   # schema + the whole vault into the dev sqlite
+npm run dev                                     # http://localhost:8788
+```
+Sign in with the `BRAIN_TOKEN` value from `.dev.vars`. The session cookie drops its
+`Secure` flag on loopback only, so plain http works locally while production stays
+https-only. The local D1 lives in `.wrangler/` and is disposable.
 
 ## Old account teardown (after verifying the new URL)
 ```bash

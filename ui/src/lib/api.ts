@@ -28,6 +28,15 @@ export type ApiKey = {
   revoked: number
   last_used: string | null
 }
+export type ScopeProject = {
+  slug: string
+  title: string
+  path: string
+  status: string | null
+  notes: number
+}
+export type ScopeArea = { prefix: string; notes: number }
+export type Scopes = { projects: ScopeProject[]; areas: ScopeArea[]; total_notes: number }
 export type CatalogSkill = { name: string; description: string; bytes?: number }
 export type SkillRef = { name: string; must: boolean }
 export type SkillEntry = { project: string; skills: SkillRef[] }
@@ -36,6 +45,12 @@ export type SkillsConfig = {
   entries: SkillEntry[]
   inherits_default: string[]
   editable: boolean
+}
+export type KeyInput = {
+  name: string
+  role: Role
+  prefixes: string[]
+  expires_days: number | null
 }
 export type SkillEntryInput = { project: string; inherits_default: boolean; skills: SkillRef[] }
 export type UnsavedSession = { path: string; date: string; project: string }
@@ -90,8 +105,10 @@ export const api = {
   skills: () => req<SkillsConfig>('skills'),
   saveSkills: (entries: SkillEntryInput[]) =>
     req<{ ok: true; commit: string }>('skills', json({ entries }, 'PUT')),
-  createKey: (body: { name: string; role: Role; prefixes: string[]; expires_days: number | null }) =>
-    req<{ id: string; key: string }>('keys', json(body)),
+  scopes: () => req<Scopes>('scopes'),
+  createKey: (body: KeyInput) => req<{ id: string; key: string }>('keys', json(body)),
+  updateKey: (id: string, patch: Partial<KeyInput>) =>
+    req<{ key: ApiKey }>('keys', json({ id, ...patch }, 'PATCH')).then((d) => d.key),
   revokeKey: (id: string) => req<{ ok: true }>('keys/revoke', json({ id })),
 }
 

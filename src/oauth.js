@@ -110,7 +110,7 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
     await env.DB.prepare(
       "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, challenge, exp, role, prefixes, key_id) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'), ?, ?, ?)"
     ).bind(await sha256hex(code), form.get('client_id') || '', redirect_uri, form.get('code_challenge') || '',
-           principal.role, JSON.stringify(principal.prefixes), principal.keyId || null).run();
+           principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
     const dest = new URL(redirect_uri);
     dest.searchParams.set('code', code);
     if (form.get('state')) dest.searchParams.set('state', form.get('state'));

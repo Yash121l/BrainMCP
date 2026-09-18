@@ -20,7 +20,7 @@ client can see at all.
 - `src/hook.js` — the PostToolUse telemetry hook + its self-extracting installer
 - `src/parse.js` — frontmatter / wikilink / chunking (shared with the seed script)
 - `src/github.js` — Contents API + Git Data API (atomic multi-file commits) + tarball reader
-- `src/auth.js` / `src/oauth.js` — scoped access keys + the OAuth 2.1 layer for claude.ai connectors
+- `src/auth.js` / `src/oauth.js` — access keys (role + path/project scopes, editable in place) + the OAuth 2.1 layer for claude.ai connectors
 - `src/app.js` — session login (`POST /app/login`) + the `/app/api/*` JSON API behind the web UI
 - `ui/` — the browser UI: Vite + React + Tailwind + shadcn/ui SPA (notes, graph, keys),
   uploaded as Workers static assets and served at `/`. The Skills tab edits

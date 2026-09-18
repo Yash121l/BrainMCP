@@ -4,7 +4,7 @@
 // search, graph, backlinks and (admin only) key management. Notes are read-only
 // here — writes go through git/MCP.
 
-import { resolvePrincipal, allowed, isAdmin, canWrite, createKey, listKeys, revokeKey, sha256hex, randToken } from './auth.js';
+import { resolvePrincipal, allowed, isAdmin, canWrite, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken } from './auth.js';
 import { getFile, putFile } from './github.js';
 import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig } from './skills.js';
 import { upsertLocal } from './indexer.js';
@@ -28,6 +28,7 @@ function daysAgo(dateStr) {
 }
 
 const UNSAVED_CAP = 25;
+const AREA_MIN_NOTES = 10;
 const BROKEN_LINKS_CAP = 50;
 
 /**
@@ -132,12 +133,15 @@ export async function handleApp(req, env, url) {
     const tok = randToken(32);
     await env.DB.prepare(
       "INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', 'webapp', datetime('now', '+30 days'), ?, ?, ?)"
-    ).bind(await sha256hex(tok), principal.role, JSON.stringify(principal.prefixes), principal.keyId || null).run();
+    ).bind(await sha256hex(tok), principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+    // Secure is mandatory everywhere except loopback, where `wrangler dev` serves
+    // plain http and a Secure cookie would be dropped, making the UI unusable locally.
+    const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
     return new Response(null, {
       status: 302,
       headers: {
         Location: '/',
-        'Set-Cookie': `brain_session=${tok}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`,
+        'Set-Cookie': `brain_session=${tok}; HttpOnly;${loopback ? '' : ' Secure;'} SameSite=Lax; Path=/; Max-Age=2592000`,
       },
     });
   }
@@ -153,7 +157,7 @@ export async function handleApp(req, env, url) {
     if (!p) return Response.json({ error: 'unauthorized' }, { status: 401 });
 
     if (url.pathname === '/app/api/me') {
-      return Response.json({ role: p.role, name: p.name, prefixes: p.prefixes });
+      return Response.json({ role: p.role, name: p.name, prefixes: p.scopes ?? p.prefixes });
     }
     if (url.pathname === '/app/api/notes') {
       const r = await env.DB.prepare('SELECT path, title, type FROM notes ORDER BY path').all();
@@ -237,6 +241,52 @@ export async function handleApp(req, env, url) {
       return Response.json({ ok: true, commit: sha });
     }
 
+    // ---- the scope vocabulary the key editor offers: real projects and real folders,
+    // so granting access is picking from the brain instead of typing paths.
+    if (url.pathname === '/app/api/scopes' && req.method === 'GET') {
+      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      const notes = (await env.DB.prepare('SELECT path, title, type, project, status FROM notes').all()).results;
+
+      const perProject = new Map();
+      const perArea = new Map();
+      for (const n of notes) {
+        if (n.project) perProject.set(n.project, (perProject.get(n.project) || 0) + 1);
+        const dirs = n.path.split('/');
+        dirs.pop();
+        let acc = '';
+        for (const d of dirs.slice(0, 2)) {
+          acc += `${d}/`;
+          perArea.set(acc, (perArea.get(acc) || 0) + 1);
+        }
+      }
+
+      const projects = notes
+        .filter((n) => n.type === 'project' && !n.path.startsWith('vault/templates/'))
+        .map((n) => {
+          const slug = n.project || n.path.split('/').pop().replace(/\.md$/, '');
+          return {
+            slug,
+            title: n.title || slug,
+            path: n.path,
+            status: n.status || null,
+            notes: perProject.get(slug) || 1,
+          };
+        })
+        .filter((x) => isProjectSlug(x.slug)) // only slugs a scope can name
+        .sort((a, b) => (a.status === 'active') === (b.status === 'active')
+          ? a.slug.localeCompare(b.slug)
+          : a.status === 'active' ? -1 : 1);
+
+      // every top-level folder, plus the sub-folders big enough to be worth granting
+      // on their own (skills/<one-skill>/ is noise; vault/logs/ is not)
+      const areas = [...perArea.entries()]
+        .filter(([prefix, count]) => prefix.split('/').length === 2 || count >= AREA_MIN_NOTES)
+        .map(([prefix, count]) => ({ prefix, notes: count }))
+        .sort((a, b) => a.prefix.localeCompare(b.prefix));
+
+      return Response.json({ projects, areas, total_notes: notes.length });
+    }
+
     // ---- key management (admin only)
     if (url.pathname === '/app/api/keys' && req.method === 'GET') {
       if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
@@ -248,6 +298,17 @@ export async function handleApp(req, env, url) {
       try {
         const created = await createKey(env, body);
         return Response.json(created, { status: 201 });
+      } catch (e) {
+        return Response.json({ error: e.message }, { status: 400 });
+      }
+    }
+    if (url.pathname === '/app/api/keys' && req.method === 'PATCH') {
+      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      const body = await req.json().catch(() => ({}));
+      if (!body.id) return Response.json({ error: 'id required' }, { status: 400 });
+      const { id, ...patch } = body;
+      try {
+        return Response.json({ key: await updateKey(env, id, patch) });
       } catch (e) {
         return Response.json({ error: e.message }, { status: 400 });
       }

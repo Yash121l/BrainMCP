@@ -21,6 +21,10 @@ import { RoleBadge } from '@/components/role-badge'
 export type Tab = 'notes' | 'graph' | 'health' | 'skills' | 'keys'
 
 const STORAGE_KEY = 'brain.tree.expanded'
+const WIDTH_KEY = 'brain.sidebar.width'
+const WIDTH_MIN = 200
+const WIDTH_MAX = 560
+const WIDTH_DEFAULT = 272
 const DEFAULT_EXPANDED = ['vault', 'skills']
 const INDENT = 14 // px per depth level
 const ROW_BASE_PAD = 8 // px before the chevron at depth 0
@@ -93,6 +97,18 @@ function ancestorsOf(path: string): string[] {
   return out
 }
 
+const clampWidth = (w: number) => Math.min(WIDTH_MAX, Math.max(WIDTH_MIN, Math.round(w)))
+
+function loadWidth(): number {
+  try {
+    const stored = Number(localStorage.getItem(WIDTH_KEY))
+    if (Number.isFinite(stored) && stored > 0) return clampWidth(stored)
+  } catch {
+    /* storage unavailable — start at the default */
+  }
+  return WIDTH_DEFAULT
+}
+
 function loadExpanded(): Set<string> {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -131,8 +147,8 @@ function FolderRow({
       <ChevronRightIcon
         className={cn('size-3.5 shrink-0 transition-transform duration-150', open && 'rotate-90')}
       />
-      <span className="truncate">{node.name}</span>
-      <span className="ml-auto pl-2 text-[10px] tabular-nums text-muted-foreground/50">
+      <span className="min-w-0 truncate">{node.name}</span>
+      <span className="ml-auto shrink-0 pl-2 text-[10px] tabular-nums text-muted-foreground/50">
         {node.count}
       </span>
     </button>
@@ -171,7 +187,7 @@ function FileRow({
         className="size-1.5 shrink-0 rounded-full"
         style={{ background: typeColor(note.type) }}
       />
-      <span className="truncate">{fileLabel(note)}</span>
+      <span className="min-w-0 truncate">{fileLabel(note)}</span>
     </button>
   )
 }
@@ -251,6 +267,30 @@ export function Sidebar({
 }) {
   const tree = useMemo(() => buildTree(notes), [notes])
   const [expanded, setExpanded] = useState<Set<string>>(loadExpanded)
+  const [width, setWidth] = useState(loadWidth)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WIDTH_KEY, String(width))
+    } catch {
+      /* storage unavailable — the width just won't persist */
+    }
+  }, [width])
+
+  const startResize = useCallback((e: React.PointerEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startWidth = e.currentTarget.parentElement?.getBoundingClientRect().width ?? WIDTH_DEFAULT
+    const onMove = (ev: PointerEvent) => setWidth(clampWidth(startWidth + ev.clientX - startX))
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      document.body.style.userSelect = ''
+    }
+    document.body.style.userSelect = 'none'
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [])
 
   const toggle = useCallback((path: string) => {
     setExpanded((prev) => {
@@ -306,7 +346,28 @@ export function Sidebar({
   ]
 
   return (
-    <aside className="flex w-[17rem] shrink-0 flex-col border-r border-border bg-sidebar">
+    <aside
+      style={{ width }}
+      className="relative flex shrink-0 flex-col border-r border-border bg-sidebar"
+    >
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        aria-valuenow={width}
+        aria-valuemin={WIDTH_MIN}
+        aria-valuemax={WIDTH_MAX}
+        tabIndex={0}
+        onPointerDown={startResize}
+        onDoubleClick={() => setWidth(WIDTH_DEFAULT)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowLeft') setWidth((w) => clampWidth(w - 16))
+          else if (e.key === 'ArrowRight') setWidth((w) => clampWidth(w + 16))
+          else return
+          e.preventDefault()
+        }}
+        className="absolute top-0 -right-1 z-10 h-full w-2 cursor-col-resize transition-colors hover:bg-primary/30 focus-visible:bg-primary/40 focus-visible:outline-none"
+      />
       <div className="flex h-14 items-center gap-2 px-3">
         <span className="flex items-center gap-2 text-sm font-semibold tracking-tight">
           <span aria-hidden className="text-base">
@@ -349,7 +410,9 @@ export function Sidebar({
 
       <Separator />
 
-      <ScrollArea className="min-h-0 flex-1">
+      {/* radix wraps scroll content in a display:table div that grows to its widest
+          row; block layout is what makes deep paths truncate instead of overflow */}
+      <ScrollArea className="min-h-0 flex-1 [&>div>div]:block!">
         <div className="p-1.5 pb-6">
           {loading ? (
             <div className="grid gap-2 px-1.5 py-1">
@@ -374,8 +437,8 @@ export function Sidebar({
       <Separator />
 
       <div className="flex items-center gap-2 px-3 py-2.5">
-        <span className="truncate text-xs text-muted-foreground">{me?.name ?? '—'}</span>
-        {me && <RoleBadge role={me.role} className="ml-auto text-[10px]" />}
+        <span className="min-w-0 truncate text-xs text-muted-foreground">{me?.name ?? '—'}</span>
+        {me && <RoleBadge role={me.role} className="ml-auto shrink-0 text-[10px]" />}
       </div>
     </aside>
   )

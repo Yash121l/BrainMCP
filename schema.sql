@@ -27,11 +27,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(path UNINDEXED, title, heading
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
--- OAuth layer (claude.ai connectors). Hashes only; rows expire.
+-- OAuth layer (claude.ai connectors). Hashes only; codes and tokens expire.
 CREATE TABLE IF NOT EXISTS oauth_clients (
   client_id     TEXT PRIMARY KEY,
-  redirect_uris TEXT,
-  created       TEXT
+  redirect_uris TEXT,   -- JSON array, 1-10 https / loopback-http URIs, matched exactly
+  created       TEXT,
+  client_name   TEXT    -- display-only, shown (escaped) on the consent page
 );
 CREATE TABLE IF NOT EXISTS oauth_codes (
   code_hash    TEXT PRIMARY KEY,
@@ -50,7 +51,7 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
   exp        TEXT,
   role       TEXT DEFAULT 'admin',   -- inherited from the key used at consent
   prefixes   TEXT DEFAULT '[]',
-  key_id     TEXT                     -- managed key that minted this token (revocation link)
+  key_id     TEXT                     -- managed key (or 'root:<generation>') that minted this token; revocation link, required
 );
 
 -- Managed access keys: named, scoped (role + path prefixes), revocable.

@@ -41,7 +41,7 @@ function unquote(s) {
 /** Extract [[wikilink]] targets (alias and heading stripped), deduped. */
 export function extractLinks(body) {
   const out = new Set();
-  for (const m of body.matchAll(/\[\[([^\]|#\n]+)(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?\]\]/g)) {
+  for (const m of body.matchAll(/\[\[([^[\]|#\n]+)(?:#[^[\]|\n]*)?(?:\|[^[\]\n]*)?\]\]/g)) {
     const t = m[1].trim();
     if (t) out.add(t);
   }
@@ -87,16 +87,19 @@ export function chunkBody(body) {
   return chunks.filter((c) => c.text);
 }
 
+// Index columns are TEXT: a list value (`title: [a, b]`) must not reach a D1 bind as an array.
+const text1 = (v) => (Array.isArray(v) ? v.join(', ') : v == null ? '' : String(v));
+
 /** Parse one vault note into its index row + links + chunks. */
 export function parseNote(path, text) {
   const { fm, body } = parseFrontmatter(text);
-  const title = fm.title || path.split('/').pop().replace(/\.md$/, '');
+  const title = text1(fm.title) || path.split('/').pop().replace(/\.md$/, '');
   return {
     path,
     title,
-    type: fm.type || '',
+    type: text1(fm.type),
     project: normalizeProject(fm.project || ''),
-    status: fm.status || '',
+    status: text1(fm.status),
     tags: JSON.stringify(Array.isArray(fm.tags) ? fm.tags : fm.tags ? [fm.tags] : []),
     frontmatter: JSON.stringify(fm),
     body: text,

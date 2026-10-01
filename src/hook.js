@@ -8,7 +8,7 @@
 // Served as a self-extracting installer from GET /hooks/install.sh:
 //   curl -fsSL -H "Authorization: Bearer $KEY" https://<host>/hooks/install.sh | sh
 
-export const HOOK_VERSION = '1';
+export const HOOK_VERSION = '2';
 
 /** The hook script itself. Records are redacted here, before they leave the machine. */
 function hookScript(origin) {
@@ -28,8 +28,12 @@ KEY="\${BRAIN_KEY:-\${BRAIN_TOKEN:-}}"
 [ -n "$KEY" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
-SPOOL="\${BRAIN_SPOOL:-\${TMPDIR:-/tmp}/brain-spool}"
-mkdir -p "$SPOOL" 2>/dev/null || exit 0
+# Records hold commands and paths: keep the spool private to this user, never in a shared temp dir.
+umask 077
+SPOOL="\${BRAIN_SPOOL:-\${XDG_CACHE_HOME:-$HOME/.cache}/brain-mcp/spool}"
+mkdir -p -m 700 "$SPOOL" 2>/dev/null || exit 0
+[ -d "$SPOOL" ] && [ ! -L "$SPOOL" ] && [ -O "$SPOOL" ] || exit 0
+chmod 700 "$SPOOL" 2>/dev/null || exit 0
 
 INPUT="$(cat 2>/dev/null || true)"
 [ -n "$INPUT" ] || exit 0
@@ -52,11 +56,38 @@ exit 0
 `;
 }
 
+// Shared by append and flush: the spool must be a real directory owned by this
+// user with no group/other bits, and spool files are opened without following
+// symlinks and only if this user owns them.
+const PY_SPOOL = String.raw`
+UID = os.getuid() if hasattr(os, "getuid") else None
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def private_dir(d):
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    return UID is None or (st.st_uid == UID and not st.st_mode & 0o077)
+
+
+def open_own(p, flags):
+    fd = os.open(p, flags | NOFOLLOW, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or (UID is not None and st.st_uid != UID):
+        os.close(fd)
+        raise OSError("not a private spool file: " + p)
+    return os.fdopen(fd, "rb" if flags == os.O_RDONLY else "r+b")
+`;
+
 // Redact first, spool second, and only then decide whether to flush. A record
 // that never matches a pattern still passes through the same path, so there is
 // no "fast path" that skips scrubbing.
 const PY_APPEND = String.raw`
-import json, os, re, sys, time, glob
+import json, os, re, stat, sys, time, glob
 
 FLUSH_AT = 25
 MAX_SPOOL_LINES = 5000
@@ -164,12 +195,17 @@ rec = {
 }
 rec.update(redact(summary))
 
+${PY_SPOOL.trim()}
+
 spool = os.environ["BRAIN_SPOOL"]
+if not private_dir(spool):
+    sys.exit(0)
 path = os.path.join(spool, sid + ".jsonl")
 try:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    with open(path, "rb") as f:
+    with open_own(path, os.O_RDWR | os.O_APPEND | os.O_CREAT) as f:
+        f.write((json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8"))
+        f.flush()
+        f.seek(0)
         lines = sum(1 for _ in f)
 except OSError:
     sys.exit(0)
@@ -190,9 +226,13 @@ print("flush" if lines >= FLUSH_AT or pending else "")
 // Rotate, then POST every pending batch. A batch is deleted only on a 2xx, so a
 // failed flush is retried on the next tool call rather than dropped.
 const PY_FLUSH = String.raw`
-import json, os, glob, time, urllib.request, urllib.error
+import json, os, glob, stat, sys, time, urllib.request, urllib.error
+
+${PY_SPOOL.trim()}
 
 spool = os.environ["BRAIN_SPOOL"]
+if not private_dir(spool):
+    sys.exit(0)
 url = os.environ["BRAIN_URL"].rstrip("/") + "/ingest/tool-calls"
 key = os.environ["BRAIN_KEY"]
 MAX_AGE = 7 * 86400
@@ -209,8 +249,8 @@ for batch in sorted(glob.glob(os.path.join(spool, "*.batch"))):
         if time.time() - os.path.getmtime(batch) > MAX_AGE:
             os.remove(batch)
             continue
-        with open(batch, encoding="utf-8") as f:
-            records = [json.loads(l) for l in f if l.strip()]
+        with open_own(batch, os.O_RDONLY) as f:
+            records = [json.loads(l) for l in f.read().decode("utf-8").split("\n") if l.strip()]
     except (OSError, ValueError):
         try:
             os.remove(batch)

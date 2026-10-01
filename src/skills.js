@@ -23,7 +23,7 @@ export function parseSkillsConfig(text) {
   const headerLines = [];
   let seenRow = false;
   for (const line of lines) {
-    const m = line.match(/^([a-z0-9-]+):[ \t]*(\S.*?)[ \t]*$/);
+    const m = line.trimEnd().match(/^([a-z0-9-]+):[ \t]*(\S.*)$/);
     if (m && !SKILLS_RESERVED_KEYS.has(m[1])) {
       entries.push({ project: m[1], raw: m[2] });
       seenRow = true;
@@ -113,6 +113,15 @@ export async function skillCatalog(env, p) {
   return res.results
     .filter((r) => allowed(p, r.path))
     .map((r) => ({ name: r.name || r.path.split('/')[1], description: r.description || '', bytes: r.bytes || 0 }));
+}
+
+/**
+ * The config rows a principal may see: all of them with read access to skills.md,
+ * otherwise the default row plus rows for projects whose note it can read.
+ */
+export function visibleEntries(p, entries) {
+  if (allowed(p, SKILLS_CONFIG_PATH)) return entries;
+  return entries.filter((e) => e.project === 'default' || allowed(p, `vault/projects/${e.project}.md`));
 }
 
 /** Read skills.md from the index, falling back to GitHub when it is not indexed yet. */

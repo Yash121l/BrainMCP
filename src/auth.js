@@ -23,8 +23,20 @@ function timingSafeEq(a, b) {
   return diff === 0;
 }
 
-const SLUG = /^[A-Za-z0-9._-]+$/;
-export const isProjectSlug = (slug) => SLUG.test(String(slug));
+const SLUG = /^[a-z0-9][A-Za-z0-9._-]*$/;
+export function isProjectSlug(slug) {
+  return SLUG.test(String(slug));
+}
+
+/**
+ * The path itself if it is a canonical repo path (relative, no backslash or control
+ * characters, no empty / '.' / '..' segment), else null. allowed() authorizes this
+ * exact string and github.js sends this exact string, so the two cannot diverge.
+ */
+export function safeRepoPath(path) {
+  if (typeof path !== 'string' || !path || path.startsWith('/') || /[\\\u0000-\u001f\u007f]/.test(path)) return null;
+  return path.split('/').some((seg) => seg === '' || seg === '.' || seg === '..') ? null : path;
+}
 
 /** The slug a `project:<slug>` scope names, or null for a path prefix. */
 export function projectScopeSlug(scope) {
@@ -71,48 +83,85 @@ export async function expandScopes(env, scopes) {
   return prefixes;
 }
 
+const LIVE_KEY = "k.revoked = 0 AND (k.expires IS NULL OR k.expires = '' OR k.expires > datetime('now'))";
+
+/**
+ * key_id stamped on credentials minted from BRAIN_TOKEN: a short hash of the current
+ * secret, so rotating BRAIN_TOKEN orphans every root-derived session and token.
+ */
+export async function rootKeyId(env) {
+  return env.BRAIN_TOKEN ? 'root:' + (await sha256hex('brainmcp-root-generation:' + env.BRAIN_TOKEN)).slice(0, 16) : null;
+}
+
+/**
+ * The live parent of a derived credential, or null if it is revoked, expired, missing
+ * or a stale root generation: { role, scopes, expires } with the key's current grant.
+ */
+export async function parentKey(env, keyId) {
+  if (!keyId) return null;
+  if (keyId === (await rootKeyId(env))) return { role: 'admin', scopes: [], expires: null };
+  const k = await env.DB.prepare(`SELECT k.role, k.prefixes, k.expires FROM api_keys k WHERE k.id = ? AND ${LIVE_KEY}`)
+    .bind(keyId).first().catch(() => null);
+  return k ? { role: k.role, scopes: JSON.parse(k.prefixes || '[]'), expires: k.expires || null } : null;
+}
+
 /**
  * Resolve a bearer token to a principal:
- * { role: 'read'|'write'|'admin', scopes: string[], prefixes: string[], via, name }
+ * { role: 'read'|'write'|'admin', scopes: string[], prefixes: string[], via, name, keyId, expires }
  * `scopes` is what was granted (for display), `prefixes` the expanded paths used for
- * access checks. Both empty = the whole brain. Returns null if invalid.
+ * access checks. Both empty = the whole brain. `keyId` is the parent key (or root
+ * generation) every credential minted from this principal must carry; `expires` is
+ * that key's expiry, which derived credentials must not outlive. Returns null if invalid.
  */
 export async function resolvePrincipal(env, token) {
   if (!token) return null;
   if (timingSafeEq(token, env.BRAIN_TOKEN)) {
-    return { role: 'admin', scopes: [], prefixes: [], via: 'root', name: 'root' };
+    return { role: 'admin', scopes: [], prefixes: [], via: 'root', name: 'root', keyId: await rootKeyId(env), expires: null };
   }
 
   const hash = await sha256hex(token);
 
   const key = await env.DB.prepare(
-    "SELECT id, name, role, prefixes FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
+    "SELECT id, name, role, prefixes, expires FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
   ).bind(hash).first().catch(() => null);
   if (key) {
     await env.DB.prepare("UPDATE api_keys SET last_used = datetime('now') WHERE id = ?").bind(key.id).run().catch(() => {});
     const scopes = JSON.parse(key.prefixes || '[]');
-    return { role: key.role, scopes, prefixes: await expandScopes(env, scopes), via: 'key', name: key.name, keyId: key.id };
+    return { role: key.role, scopes, prefixes: await expandScopes(env, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null };
   }
 
+  // A session / connector token is only as alive as its parent: the current root
+  // generation, or a managed key that still exists, is not revoked and has not expired.
   const tok = await env.DB.prepare(
-    "SELECT role, prefixes, client_id FROM oauth_tokens WHERE token_hash = ? AND kind = 'access' AND exp > datetime('now')"
-  ).bind(hash).first().catch(() => null);
+    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.expires AS key_expires FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
+     WHERE t.token_hash = ? AND t.kind = 'access' AND t.exp > datetime('now') AND (t.key_id = ? OR (${LIVE_KEY}))`
+  ).bind(hash, await rootKeyId(env)).first().catch(() => null);
   if (tok) {
     const scopes = JSON.parse(tok.prefixes || '[]');
-    return { role: tok.role || 'admin', scopes, prefixes: await expandScopes(env, scopes), via: 'oauth', name: tok.client_id };
+    return { role: tok.role || 'admin', scopes, prefixes: await expandScopes(env, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null };
   }
 
   return null;
 }
 
-/** May this principal read the given repo path? */
+/**
+ * May this principal read the given repo path? Non-canonical paths never pass. A
+ * prefix ending in '/' is a folder; any other prefix matches itself or below a '/'.
+ */
 export function allowed(p, path) {
-  if (!p) return false;
+  if (!p || safeRepoPath(path) === null) return false;
   if (!p.prefixes || p.prefixes.length === 0) return true;
-  return p.prefixes.some((pre) => path.startsWith(pre));
+  return p.prefixes.some((pre) => (pre.endsWith('/') ? path.startsWith(pre) : path === pre || path.startsWith(pre + '/')));
 }
 export const canWrite = (p) => !!p && (p.role === 'write' || p.role === 'admin');
 export const isAdmin = (p) => !!p && p.role === 'admin';
+/** Whole-brain admin (root token or an unscoped admin key): key management, reindex, rollup. */
+export const isRootAdmin = (p) => isAdmin(p) && (!p.scopes || p.scopes.length === 0);
+
+// Admin is a whole-brain role; a scoped admin could otherwise mint itself out of its scope.
+function checkGrant(role, scopes) {
+  if (role === 'admin' && scopes.length) throw new Error('admin keys cannot be scoped; use write for a scoped key');
+}
 
 const expiresSql = (days) =>
   days == null || days === '' ? 'NULL' : `datetime('now', '+${Math.max(1, Math.min(3650, Number(days) | 0))} days')`;
@@ -121,6 +170,7 @@ const expiresSql = (days) =>
 export async function createKey(env, { name, role = 'read', prefixes = [], expires_days = null }) {
   if (!ROLES.includes(role)) throw new Error('role must be read|write|admin');
   const scopes = normalizeScopes(prefixes);
+  checkGrant(role, scopes);
   const id = 'k_' + randToken(6);
   const key = 'bk_' + randToken(24);
   await env.DB.prepare(
@@ -165,13 +215,16 @@ export async function updateKey(env, id, patch = {}) {
   }
   if (patch.expires_days !== undefined) sets.push(`expires = ${expiresSql(patch.expires_days)}`);
   if (!sets.length) throw new Error('nothing to update');
+  checkGrant(role, scopes);
 
   await env.DB.prepare(`UPDATE api_keys SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, id).run();
   if (patch.role !== undefined || patch.prefixes !== undefined) {
-    await env.DB.prepare('UPDATE oauth_tokens SET role = ?, prefixes = ? WHERE key_id = ?')
-      .bind(role, JSON.stringify(scopes), id)
-      .run()
-      .catch(() => {});
+    for (const table of ['oauth_tokens', 'oauth_codes']) {
+      await env.DB.prepare(`UPDATE ${table} SET role = ?, prefixes = ? WHERE key_id = ?`)
+        .bind(role, JSON.stringify(scopes), id)
+        .run()
+        .catch(() => {});
+    }
   }
   return getKey(env, id);
 }
@@ -191,6 +244,7 @@ export async function listKeys(env) {
 
 export async function revokeKey(env, id) {
   await env.DB.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').bind(id).run();
-  // also kill every web session / connector token minted from this key
+  // also kill every web session / connector token / pending consent code minted from this key
   await env.DB.prepare('DELETE FROM oauth_tokens WHERE key_id = ?').bind(id).run().catch(() => {});
+  await env.DB.prepare('DELETE FROM oauth_codes WHERE key_id = ?').bind(id).run().catch(() => {});
 }

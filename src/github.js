@@ -1,6 +1,15 @@
 // GitHub API helpers. All writes go through here; git stays the source of truth.
 
+import { safeRepoPath } from './auth.js';
+
 const API = 'https://api.github.com';
+
+/** Reject non-canonical paths (they would be dot-normalized into another file) and encode each segment. */
+function checkedPath(path) {
+  if (safeRepoPath(path) === null) throw new Error(`invalid repo path: ${JSON.stringify(String(path)).slice(0, 200)}`);
+  return path;
+}
+const encodePath = (path) => checkedPath(path).split('/').map(encodeURIComponent).join('/');
 
 function headers(env, extra = {}) {
   return {
@@ -22,7 +31,7 @@ async function gh(env, path, init = {}) {
 
 /** Fetch a file's raw content + sha. Returns null if missing. */
 export async function getFile(env, path) {
-  const res = await gh(env, `/repos/${env.REPO}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}?ref=${env.BRANCH}`);
+  const res = await gh(env, `/repos/${env.REPO}/contents/${encodePath(path)}?ref=${env.BRANCH}`);
   if (res.status === 404) return null;
   const j = await res.json();
   const content = decodeBase64(j.content || '');
@@ -31,6 +40,7 @@ export async function getFile(env, path) {
 
 /** Create or update a single file. Pass sha when updating. Returns new content sha. */
 export async function putFile(env, path, content, message, sha) {
+  const target = encodePath(path);
   const body = {
     message,
     content: encodeBase64(content),
@@ -38,7 +48,7 @@ export async function putFile(env, path, content, message, sha) {
     committer: { name: 'BrainMCP', email: 'brainmcp@users.noreply.github.com' },
   };
   if (sha) body.sha = sha;
-  const res = await fetch(`${API}/repos/${env.REPO}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}`, {
+  const res = await fetch(`${API}/repos/${env.REPO}/contents/${target}`, {
     method: 'PUT',
     headers: headers(env),
     body: JSON.stringify(body),
@@ -69,6 +79,7 @@ export async function appendFile(env, path, appendText, message) {
 
 /** Atomic multi-file commit via the Git Data API. files: [{path, content}]. */
 export async function multiCommit(env, files, message) {
+  for (const f of files) checkedPath(f.path);
   const refRes = await gh(env, `/repos/${env.REPO}/git/ref/heads/${env.BRANCH}`);
   if (refRes.status === 404) throw new Error(`branch ${env.BRANCH} not found`);
   const headSha = (await refRes.json()).object.sha;
@@ -108,13 +119,21 @@ export async function multiCommit(env, files, message) {
 }
 
 /** Fetch the repo tarball (for full reindex). Returns ArrayBuffer of the .tar after gunzip. */
-export async function fetchRepoTar(env) {
+export async function fetchRepoTar(env, { maxBytes = Infinity } = {}) {
   const res = await fetch(`${API}/repos/${env.REPO}/tarball/${env.BRANCH}`, {
     headers: headers(env),
     redirect: 'follow',
   });
   if (!res.ok) throw new Error(`tarball -> ${res.status}`);
-  const gunzip = res.body.pipeThrough(new DecompressionStream('gzip'));
+  let seen = 0;
+  const cap = new TransformStream({
+    transform(chunk, ctl) {
+      seen += chunk.byteLength;
+      if (seen > maxBytes) throw new Error(`repo tarball is ${seen} bytes decompressed, over the ${maxBytes}-byte cap`);
+      ctl.enqueue(chunk);
+    },
+  });
+  const gunzip = res.body.pipeThrough(new DecompressionStream('gzip')).pipeThrough(cap);
   return await new Response(gunzip).arrayBuffer();
 }
 

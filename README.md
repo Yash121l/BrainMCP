@@ -52,7 +52,7 @@ nightly into `meta.hygiene` and summarised in `/health`.
 
 ## Telemetry
 The only thing still running on a machine is a `PostToolUse` hook. It redacts each
-record locally, spools it to `$TMPDIR/brain-spool`, and batch-POSTs to
+record locally, spools it to a private `${XDG_CACHE_HOME:-~/.cache}/brain-mcp/spool` (mode 0700), and batch-POSTs to
 `/ingest/tool-calls`; a failed POST is retried on the next tool call rather than
 dropped. Rows sit in D1 for the day (queryable in SQL) and the 03:00 cron rolls each
 completed day into one R2 object per session at `tool-calls/<date>/<session>.jsonl`.

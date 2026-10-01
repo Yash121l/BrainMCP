@@ -4,13 +4,13 @@
 // search, graph, backlinks and (admin only) key management. Notes are read-only
 // here — writes go through git/MCP.
 
-import { resolvePrincipal, allowed, isAdmin, canWrite, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken } from './auth.js';
+import { resolvePrincipal, allowed, isRootAdmin, canWrite, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken } from './auth.js';
 import { getFile, putFile } from './github.js';
-import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig } from './skills.js';
+import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig, visibleEntries } from './skills.js';
 import { upsertLocal } from './indexer.js';
 
 async function sessionPrincipal(req, env) {
-  const m = (req.headers.get('Cookie') || '').match(/brain_session=([^;]+)/);
+  const m = (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/);
   if (!m) return null;
   return resolvePrincipal(env, m[1]);
 }
@@ -36,11 +36,6 @@ const BROKEN_LINKS_CAP = 50;
  * Pass { role: 'admin', prefixes: [] } for the unscoped/cron view.
  */
 export async function computeHygiene(env, p) {
-  const [notesRow, linksRow] = await Promise.all([
-    env.DB.prepare('SELECT COUNT(*) AS c FROM notes').first(),
-    env.DB.prepare('SELECT COUNT(*) AS c FROM links').first(),
-  ]);
-
   // ---- sessions: unsaved (no summary, older than a day) + activity in the last 7 days
   const sessions = (
     await env.DB.prepare(
@@ -87,8 +82,9 @@ export async function computeHygiene(env, p) {
     if (d?.body) decisions_total = (d.body.match(/### \[/g) || []).length;
   }
 
-  // ---- broken wikilinks (resolved the same way the graph endpoint resolves them)
-  const allNotes = (await env.DB.prepare('SELECT path FROM notes').all()).results;
+  // ---- broken wikilinks (resolved the same way the graph endpoint resolves them).
+  // Only readable notes resolve a link, so an out-of-scope target reads as missing.
+  const allNotes = (await env.DB.prepare('SELECT path FROM notes').all()).results.filter((n) => allowed(p, n.path));
   const byNoExt = new Map();
   const byBase = new Map();
   for (const n of allNotes) {
@@ -97,12 +93,11 @@ export async function computeHygiene(env, p) {
     const b = ne.split('/').pop();
     if (!byBase.has(b)) byBase.set(b, n.path);
   }
-  const links = (await env.DB.prepare('SELECT src, dst FROM links').all()).results;
+  const links = (await env.DB.prepare('SELECT src, dst FROM links').all()).results.filter((l) => allowed(p, l.src));
   const broken = [];
   for (const l of links) {
     const dst = String(l.dst || '');
     if (!dst || dst.includes('#')) continue; // heading-only / in-note anchors aren't notes
-    if (!allowed(p, l.src)) continue;
     const target = byNoExt.get(dst) || byNoExt.get(`vault/${dst}`) || byBase.get(dst.split('/').pop());
     if (!target) broken.push({ src: l.src, dst });
   }
@@ -110,8 +105,8 @@ export async function computeHygiene(env, p) {
   return {
     generated_at: new Date().toISOString(),
     counts: {
-      notes: notesRow?.c ?? 0,
-      links: linksRow?.c ?? 0,
+      notes: allNotes.length,
+      links: links.length,
       sessions_7d,
       decisions_total,
     },
@@ -131,9 +126,13 @@ export async function handleApp(req, env, url) {
     const principal = await resolvePrincipal(env, form.get('access_key') || '');
     if (!principal) return new Response('invalid or revoked key', { status: 403 });
     const tok = randToken(32);
+    // A session never outlives the key it was minted from.
     await env.DB.prepare(
-      "INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', 'webapp', datetime('now', '+30 days'), ?, ?, ?)"
-    ).bind(await sha256hex(tok), principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+      `INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', 'webapp',
+         min(datetime('now', '+30 days'), coalesce(datetime(?), datetime('now', '+30 days'))), ?, ?, ?)`
+    ).bind(await sha256hex(tok), principal.expires || null, principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+    const keyLeft = principal.expires ? Math.floor((Date.parse(principal.expires.replace(' ', 'T') + 'Z') - Date.now()) / 1000) : NaN;
+    const maxAge = Number.isFinite(keyLeft) ? Math.max(0, Math.min(2592000, keyLeft)) : 2592000;
     // Secure is mandatory everywhere except loopback, where `wrangler dev` serves
     // plain http and a Secure cookie would be dropped, making the UI unusable locally.
     const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
@@ -141,7 +140,7 @@ export async function handleApp(req, env, url) {
       status: 302,
       headers: {
         Location: '/',
-        'Set-Cookie': `brain_session=${tok}; HttpOnly;${loopback ? '' : ' Secure;'} SameSite=Lax; Path=/; Max-Age=2592000`,
+        'Set-Cookie': `brain_session=${tok}; HttpOnly;${loopback ? '' : ' Secure;'} SameSite=Lax; Path=/; Max-Age=${maxAge}`,
       },
     });
   }
@@ -182,9 +181,15 @@ export async function handleApp(req, env, url) {
     if (url.pathname === '/app/api/search') {
       const q = (url.searchParams.get('q') || '').split(/\s+/).filter(Boolean).map((t) => `"${t.replace(/"/g, '""')}"`).join(' ');
       if (!q) return Response.json({ results: [] });
-      const r = await env.DB.prepare(
-        "SELECT DISTINCT f.path, snippet(fts, 3, '<b>', '</b>', ' … ', 20) AS snippet FROM fts f WHERE fts MATCH ? ORDER BY rank LIMIT 60"
-      ).bind(q).all().catch(() => ({ results: [] }));
+      // Scope goes into SQL so out-of-scope matches cannot crowd readable ones out of the
+      // LIMIT window; same rule as allowed(): exact path, or below the prefix's folder.
+      let sql = "SELECT DISTINCT f.path, snippet(fts, 3, '<b>', '</b>', ' … ', 20) AS snippet FROM fts f WHERE fts MATCH ?";
+      const binds = [q];
+      if (p.prefixes?.length) {
+        sql += " AND EXISTS (SELECT 1 FROM json_each(?) j WHERE f.path = j.value OR substr(f.path, 1, length(rtrim(j.value, '/')) + 1) = rtrim(j.value, '/') || '/')";
+        binds.push(JSON.stringify(p.prefixes));
+      }
+      const r = await env.DB.prepare(sql + ' ORDER BY rank LIMIT 60').bind(...binds).all().catch(() => ({ results: [] }));
       return Response.json({ results: r.results.filter((x) => allowed(p, x.path)).slice(0, 20) });
     }
     if (url.pathname === '/app/api/graph') {
@@ -215,7 +220,7 @@ export async function handleApp(req, env, url) {
 
     if (url.pathname === '/app/api/skills' && req.method === 'GET') {
       const [catalog, configText] = await Promise.all([skillCatalog(env, p), readSkillsConfig(env)]);
-      const { entries } = skillsConfigEntries(configText);
+      const entries = visibleEntries(p, skillsConfigEntries(configText).entries);
       return Response.json({
         catalog,
         entries,
@@ -244,7 +249,7 @@ export async function handleApp(req, env, url) {
     // ---- the scope vocabulary the key editor offers: real projects and real folders,
     // so granting access is picking from the brain instead of typing paths.
     if (url.pathname === '/app/api/scopes' && req.method === 'GET') {
-      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
       const notes = (await env.DB.prepare('SELECT path, title, type, project, status FROM notes').all()).results;
 
       const perProject = new Map();
@@ -289,11 +294,11 @@ export async function handleApp(req, env, url) {
 
     // ---- key management (admin only)
     if (url.pathname === '/app/api/keys' && req.method === 'GET') {
-      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
       return Response.json({ keys: await listKeys(env) });
     }
     if (url.pathname === '/app/api/keys' && req.method === 'POST') {
-      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
       try {
         const created = await createKey(env, body);
@@ -303,7 +308,7 @@ export async function handleApp(req, env, url) {
       }
     }
     if (url.pathname === '/app/api/keys' && req.method === 'PATCH') {
-      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
       if (!body.id) return Response.json({ error: 'id required' }, { status: 400 });
       const { id, ...patch } = body;
@@ -314,7 +319,7 @@ export async function handleApp(req, env, url) {
       }
     }
     if (url.pathname === '/app/api/keys/revoke' && req.method === 'POST') {
-      if (!isAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
       if (!body.id) return Response.json({ error: 'id required' }, { status: 400 });
       await revokeKey(env, body.id);

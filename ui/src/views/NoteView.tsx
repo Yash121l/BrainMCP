@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CornerUpLeftIcon, FileTextIcon } from 'lucide-react'
 
@@ -11,6 +11,10 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
+
+// Wikilinks use our own schemes; everything else gets react-markdown's safe-protocol filter.
+const urlTransform = (url: string) =>
+  url.startsWith(WIKI_SCHEME) || url.startsWith(WIKI_DEAD) ? url : defaultUrlTransform(url)
 
 export function NoteView({
   note,
@@ -150,7 +154,7 @@ export function NoteView({
         >
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            urlTransform={(url) => url}
+            urlTransform={urlTransform}
             components={components}
           >
             {body}

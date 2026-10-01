@@ -14,6 +14,9 @@ const LINK_HOT = 'rgba(167,139,250,0.85)'
 
 type FGNode = { id: string; title: string; type: string; x?: number; y?: number }
 
+// force-graph renders a string label as HTML; note titles and types are user content.
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
+
 export function GraphView({
   data,
   loading,
@@ -70,7 +73,7 @@ export function GraphView({
       // hover highlighting reads external state, so the canvas must keep redrawing
       .autoPauseRedraw(false)
       .nodeRelSize(4)
-      .nodeLabel((n) => `${n.title || n.id}  ·  ${n.type}`)
+      .nodeLabel((n) => escapeHtml(`${n.title || n.id}  ·  ${n.type}`))
       .nodeVal((n) => 1 + Math.sqrt(degree.get(n.id) ?? 0) * 1.6)
       .nodeColor((n) => (near(n.id) ? typeColor(n.type) : DIM_NODE))
       .linkColor((l) => (hoverRef.current ? (hot(l) ? LINK_HOT : DIM_LINK) : LINK))

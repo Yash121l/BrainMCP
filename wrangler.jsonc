@@ -29,6 +29,9 @@
   // Deliberately NOT declared here: managing it from CI requires Zone->Workers
   // Routes:Edit on the API token, which the CI token intentionally doesn't have.
   // If the domain ever detaches, re-add it in dash -> Workers -> brain-mcp -> Domains.
+  // workers.dev stays on (the GitHub webhook points at it, see scripts/setup.sh), but
+  // per-version Preview URLs are off: an old version must not serve production bindings.
+  "preview_urls": false,
   "vars": {
     "REPO": "Yash121l/brain",
     "BRANCH": "main"

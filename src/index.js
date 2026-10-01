@@ -6,37 +6,79 @@ import { parseNote, isIndexable, normalizeProject } from './parse.js';
 import { upsertNotes, deleteNotes, upsertLocal } from './indexer.js';
 import { getFile, putFile, appendFile, multiCommit, fetchRepoTar, tarEntries, encodeBase64 } from './github.js';
 import { handleOauth } from './oauth.js';
-import { resolvePrincipal, allowed, canWrite, isAdmin, createKey, listKeys, revokeKey } from './auth.js';
+import { resolvePrincipal, allowed, canWrite, isRootAdmin, isProjectSlug, safeRepoPath } from './auth.js';
 import { handleApp, computeHygiene } from './app.js';
-import { skillCatalog, readSkillsConfig, skillsConfigEntries, skillsPayload } from './skills.js';
+import { skillCatalog, readSkillsConfig, skillsConfigEntries, skillsPayload, visibleEntries } from './skills.js';
 import { hookInstaller, HOOK_VERSION } from './hook.js';
 
 // ---------------------------------------------------------------- indexing
 
+/** Note the paths an index run skipped (meta 'index_skipped'), so a bad file is visible, not silent. */
+async function recordSkipped(env, source, skipped, always = false) {
+  if (!skipped.length && !always) return;
+  if (skipped.length) console.log(`${source}: skipped ${skipped.length} note(s):`, skipped.slice(0, 5).map((s) => s.path).join(', '));
+  const rows = skipped.slice(0, 50).map((s) => ({ path: String(s.path).slice(0, 300), error: String(s.error).slice(0, 200) }));
+  await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('index_skipped', ?)")
+    .bind(JSON.stringify({ at: new Date().toISOString(), source, total: skipped.length, skipped: rows })).run().catch(() => {});
+}
+
 async function indexFromGitHub(env, paths) {
   const parsed = [];
+  const skipped = [];
   for (const p of paths) {
-    const f = await getFile(env, p);
-    if (f) parsed.push(parseNote(p, f.content));
+    if (safeRepoPath(p) === null) { skipped.push({ path: p, error: 'non-canonical path' }); continue; }
+    try {
+      const f = await getFile(env, p);
+      if (f) parsed.push(parseNote(p, f.content));
+    } catch (e) {
+      skipped.push({ path: p, error: e.message });
+    }
   }
-  await upsertNotes(env, parsed);
+  skipped.push(...(await upsertNotes(env, parsed)));
+  await recordSkipped(env, 'webhook', skipped);
   return parsed.length;
 }
 
+// Decompressed repo tarball ceiling (bytes); env.TAR_MAX_BYTES overrides.
+const TAR_MAX_BYTES = 64 * 1024 * 1024;
+
+async function repoTar(env) {
+  const max = Number(env.TAR_MAX_BYTES) || TAR_MAX_BYTES;
+  // maxBytes lets fetchRepoTar stop decompressing early; the length check refuses an oversized tree either way.
+  const tar = await fetchRepoTar(env, { maxBytes: max });
+  if (tar.byteLength > max) throw new Error(`repo tarball is ${tar.byteLength} bytes decompressed, over the ${max}-byte cap`);
+  return tar;
+}
+
 async function fullReindex(env) {
-  const tar = await fetchRepoTar(env);
+  const tar = await repoTar(env);
+  // rows this run refreshes get indexed_at >= start; the margin absorbs Worker/D1 clock skew
+  const start = new Date(Date.now() - 10 * 60000).toISOString().replace('T', ' ').slice(0, 19);
   const parsed = [];
+  const skipped = [];
   for (const e of tarEntries(tar)) {
-    if (isIndexable(e.path)) parsed.push(parseNote(e.path, e.text()));
+    if (!isIndexable(e.path)) continue;
+    if (safeRepoPath(e.path) === null) { skipped.push({ path: e.path, error: 'non-canonical path' }); continue; }
+    try {
+      parsed.push(parseNote(e.path, e.text()));
+    } catch (err) {
+      skipped.push({ path: e.path, error: err.message });
+    }
   }
+  if (!parsed.length) throw new Error('repo tarball has no notes; index left unchanged');
+  const failed = await upsertNotes(env, parsed);
+  skipped.push(...failed);
+  // Upsert first, then drop rows this run did not refresh (skipped notes keep their old
+  // rows), so a failed rebuild leaves the previous index rather than an empty one.
   await env.DB.batch([
-    env.DB.prepare('DELETE FROM notes'),
-    env.DB.prepare('DELETE FROM links'),
-    env.DB.prepare('DELETE FROM fts'),
+    env.DB.prepare("DELETE FROM notes WHERE (indexed_at IS NULL OR indexed_at < ?) AND path NOT IN (SELECT value FROM json_each(?))")
+      .bind(start, JSON.stringify(skipped.map((s) => s.path))),
+    env.DB.prepare('DELETE FROM links WHERE src NOT IN (SELECT path FROM notes)'),
+    env.DB.prepare('DELETE FROM fts WHERE path NOT IN (SELECT path FROM notes)'),
   ]);
-  await upsertNotes(env, parsed);
   await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_full_reindex', datetime('now'))").run();
-  return parsed.length;
+  await recordSkipped(env, 'reindex', skipped, true);
+  return { indexed: parsed.length - failed.length, skipped };
 }
 
 // ---------------------------------------------------------------- helpers
@@ -45,8 +87,29 @@ const nowDate = () => new Date().toISOString().slice(0, 10);
 const nowTime = () => new Date().toISOString().slice(11, 19).replace(/:/g, '');
 const randId = (n = 4) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join('');
 
+/** The <date>_<time> part of a session log filename, as a GLOB. */
+const SESS_DATE_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]';
 /** Sanitize a client-supplied session id down to something safe in a filename. */
 const sessionKey = (v) => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+
+/** A positive integer limit no larger than max; anything else (NaN, 0, negative) is the default. */
+const clampLimit = (v, dflt, max) => {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, max) : dflt;
+};
+
+/**
+ * SQL twin of allowed()'s prefix match on `col`, with the whole prefix list bound as one
+ * JSON parameter. `col` must be table-qualified: json_each has its own hidden `path` column.
+ */
+const scopeSql = (col) =>
+  ` AND EXISTS (SELECT 1 FROM json_each(?) j WHERE substr(${col}, 1, length(j.value)) = j.value`
+  + ` AND (substr(j.value, -1) = '/' OR length(${col}) = length(j.value) OR substr(${col}, length(j.value) + 1, 1) = '/'))`;
+
+/** POSIX single-quoted shell literal. */
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+/** Skill file paths the installer will emit: plain segments only. */
+const SAFE_REL = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 
 function ftsQuery(q) {
   // sanitize to phrase-per-token to avoid FTS5 syntax errors on user input
@@ -60,17 +123,19 @@ function ftsQuery(q) {
 // ------------------------------------------------- vault file composers (shared)
 
 const yamlStr = (s) => String(s ?? '').replace(/"/g, "'").replace(/\r?\n/g, ' ');
+/** One line with no '### [' marker, so text cannot forge a decision block or a frontmatter key. */
+const oneLine = (s) => String(s ?? '').replace(/\s*[\r\n]+\s*/g, ' ').replace(/#{3} \[/g, '[').trim();
 
 /** Standard cloud session note. Same shape for append_session_log and save. */
 function sessionNote({ slug, summary, body, next_steps, surface, date, id }) {
   return `---
 type: session
-project: ${slug ? `"[[projects/${slug}]]"` : '""'}
+project: ${slug ? `"[[projects/${yamlStr(slug)}]]"` : '""'}
 date: ${date}
 started: ${new Date().toISOString()}
 summary: "${yamlStr(summary)}"
 duration:
-surface: ${surface}
+surface: "${yamlStr(surface)}"
 session_key: ${id}
 tags: [session, cloud]
 ---
@@ -84,16 +149,16 @@ ${body}
 ${next_steps || '- (none)'}
 
 ## Links
-- Project: ${slug ? `[[projects/${slug}]]` : '(none)'}
+- Project: ${slug ? `[[projects/${oneLine(slug)}]]` : '(none)'}
 `;
 }
 
 /** One append-only rich block for vault/logs/decisions.md. */
 function decisionBlock(decision, rationale, slug, date) {
-  const d = String(decision).trim();
+  const d = oneLine(decision);
   const title = d.length > 90 ? d.slice(0, 90) + '…' : d;
-  const project = slug ? `[[projects/${slug}]]` : '(none)';
-  return `\n### [${date}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${String(rationale || '').trim()}\n- **Project:** ${project}\n`;
+  const project = slug ? `[[projects/${oneLine(slug)}]]` : '(none)';
+  return `\n### [${date}] ${title}\n- **Chosen:** ${d}\n- **Why:** ${oneLine(rationale)}\n- **Project:** ${project}\n`;
 }
 
 /** A topic note (full file — replaces any existing one). */
@@ -349,6 +414,7 @@ async function callTool(env, name, args = {}, p) {
   switch (name) {
     case 'get_context': {
       const slug = normalizeProject(args.project || '');
+      if (slug && !isProjectSlug(slug)) return { error: `invalid project slug: ${JSON.stringify(slug.slice(0, 80))}` };
       const out = {};
       out.session_id = sessionKey(args.client_session_id) || `srv${randId(6)}`;
       out.skills = await skillsPayload(env, p, slug);
@@ -360,8 +426,11 @@ async function callTool(env, name, args = {}, p) {
       }));
       if (slug) {
         if (!allowed(p, `vault/projects/${slug}.md`)) return deny(`your key has no access to project ${slug}`);
-        const rules = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`vault/rules/${slug}.md`).first();
-        out.binding_rules = rules ? rules.body : `(no rules/${slug}.md)`;
+        // the rules file is a different note; it needs its own read grant, like read_note
+        const rulesPath = `vault/rules/${slug}.md`;
+        const rules = allowed(p, rulesPath)
+          ? await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(rulesPath).first() : null;
+        out.binding_rules = rules ? rules.body : `(no rules/${slug}.md, or not in this key's scope)`;
         const proj = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`vault/projects/${slug}.md`).first();
         out.project_note = proj ? proj.body : `(no projects/${slug}.md)`;
         const dec = allowed(p, 'vault/logs/decisions.md')
@@ -388,7 +457,7 @@ async function callTool(env, name, args = {}, p) {
     }
 
     case 'search': {
-      const limit = Math.min(args.limit || 10, 50);
+      const limit = clampLimit(args.limit, 10, 50);
       let sql =
         "SELECT f.path, n.title, n.type, n.project, n.updated, snippet(fts, 3, '«', '»', ' … ', 24) AS snippet FROM fts f JOIN notes n ON n.path = f.path WHERE fts MATCH ?";
       const binds = [ftsQuery(args.q)];
@@ -400,10 +469,12 @@ async function callTool(env, name, args = {}, p) {
       if (!args.include_logs && !args.type && !args.folder) {
         sql += " AND n.type != 'session' AND f.path NOT LIKE 'vault/logs/activity/%'";
       }
+      // scope lives in SQL so ranking and LIMIT only ever see readable notes
+      if (p.prefixes?.length) { sql += scopeSql('n.path'); binds.push(JSON.stringify(p.prefixes)); }
       sql += ' ORDER BY rank LIMIT ?';
-      binds.push(limit * 3); // over-fetch; scope filter may drop rows
+      binds.push(limit * 3); // over-fetch; several chunks of one note collapse to one result
       const res = await env.DB.prepare(sql).bind(...binds).all();
-      // dedupe by path keeping best-ranked snippet; enforce key scopes
+      // dedupe by path keeping best-ranked snippet; allowed() again as defense in depth
       const seen = new Map();
       for (const r of res.results) if (allowed(p, r.path) && !seen.has(r.path)) seen.set(r.path, r);
       return { results: [...seen.values()].slice(0, limit) };
@@ -422,15 +493,16 @@ async function callTool(env, name, args = {}, p) {
     }
 
     case 'list_notes': {
-      const limit = Math.min(args.limit || 50, 200);
-      let sql = "SELECT path, title, type, project, status, updated FROM notes WHERE 1=1";
+      const limit = clampLimit(args.limit, 50, 200);
+      let sql = "SELECT path, title, type, project, status, updated FROM notes n WHERE 1=1";
       const binds = [];
       if (args.type) { sql += ' AND type = ?'; binds.push(args.type); }
       if (args.status) { sql += ' AND status = ?'; binds.push(args.status); }
       if (args.project) { sql += ' AND project = ?'; binds.push(normalizeProject(args.project)); }
       if (args.folder) { sql += ' AND path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
+      if (p.prefixes?.length) { sql += scopeSql('n.path'); binds.push(JSON.stringify(p.prefixes)); }
       sql += ' ORDER BY updated DESC, path DESC LIMIT ?';
-      binds.push(limit * 3);
+      binds.push(limit);
       const res = await env.DB.prepare(sql).bind(...binds).all();
       return { notes: res.results.filter((r) => allowed(p, r.path)).slice(0, limit) };
     }
@@ -508,10 +580,11 @@ async function callTool(env, name, args = {}, p) {
       // 1. session log — always written. When the caller passes back the
       // session_id from get_context we update that note in place, so saving
       // twice in one session yields one note, not two.
+      // Only this session's own canonical log file qualifies; frontmatter is writable
+      // by any in-scope key, so it never picks the target. sessId is [A-Za-z0-9_-], no GLOB metacharacters.
       const sessId = sessionKey(args.session_id) || `cloud${randId(4)}`;
-      const prior = await env.DB.prepare(
-        "SELECT path FROM notes WHERE type = 'session' AND json_extract(frontmatter, '$.session_key') = ? ORDER BY path LIMIT 1"
-      ).bind(sessId).first();
+      const prior = await env.DB.prepare('SELECT path FROM notes WHERE path GLOB ? ORDER BY path LIMIT 1')
+        .bind(`vault/logs/sessions/${SESS_DATE_GLOB}_${sessId}.md`).first();
       const sessPath = prior?.path || `vault/logs/sessions/${date}_${nowTime()}_${sessId}.md`;
       if (!allowed(p, sessPath)) return deny(`no write access to ${sessPath}`);
       files.push({
@@ -572,7 +645,7 @@ async function callTool(env, name, args = {}, p) {
 
     case 'list_skills': {
       const [skills, configText] = await Promise.all([skillCatalog(env, p), readSkillsConfig(env)]);
-      return { skills, mappings: skillsConfigEntries(configText).entries };
+      return { skills, mappings: visibleEntries(p, skillsConfigEntries(configText).entries) };
     }
 
     case 'get_skill': {
@@ -588,6 +661,8 @@ async function callTool(env, name, args = {}, p) {
 }
 
 // ---------------------------------------------------------------- MCP JSON-RPC
+
+const RPC_BATCH_CAP = 20;
 
 function rpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
@@ -641,13 +716,22 @@ async function getPrincipal(req, env) {
 
 const INGEST_BATCH_CAP = 500;
 const INGEST_PAYLOAD_CAP = 8000;
+const INGEST_BUFFER_CAP = 20000; // rows across all keys; the nightly rollup drains them
+const INGEST_MAX_AGE_DAYS = 8;
+const ROLLUP_PAGE = 1000; // rows read per query
+const ROLLUP_MAX_GROUPS = 100; // R2 objects written per run; the rest wait for the next run
 
 /** Buffer a batch of redacted tool-call records into D1. */
 async function ingestToolCalls(env, records) {
-  const capped = records.slice(0, INGEST_BATCH_CAP);
+  const buffered = Number((await env.DB.prepare('SELECT COUNT(*) AS c FROM tool_calls').first())?.c) || 0;
+  const capped = records.slice(0, Math.max(0, Math.min(INGEST_BATCH_CAP, INGEST_BUFFER_CAP - buffered)));
+  const today = nowDate();
+  const oldest = new Date(Date.now() - INGEST_MAX_AGE_DAYS * 86400000).toISOString().slice(0, 10);
   const stmts = capped.map((r) => {
     const ts = String(r?.ts || new Date().toISOString());
-    const day = /^\d{4}-\d{2}-\d{2}/.test(ts) ? ts.slice(0, 10) : nowDate();
+    // the client's day is only a hint: clamp it into [today-8d, today] so every row reaches the drain
+    const claimed = /^\d{4}-\d{2}-\d{2}/.test(ts) ? ts.slice(0, 10) : today;
+    const day = claimed > today ? today : claimed < oldest ? oldest : claimed;
     return env.DB.prepare(
       'INSERT INTO tool_calls (session, day, ts, surface, cwd, project, tool, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(
@@ -672,37 +756,56 @@ async function ingestToolCalls(env, records) {
 async function rollUpToolCalls(env) {
   if (!env.LOGS) return { skipped: 'no R2 binding' };
   const today = nowDate();
-  const rows = (
-    await env.DB.prepare('SELECT session, day, payload FROM tool_calls WHERE day < ? ORDER BY day, session, id')
-      .bind(today).all()
-  ).results;
-  if (!rows.length) return { rolled: 0, objects: 0 };
-
-  const groups = new Map();
-  for (const r of rows) {
-    const k = `${r.day}/${r.session}`;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(r.payload);
+  let rolled = 0;
+  let objects = 0;
+  let more = false;
+  // Bounded pages; each (day, session) group leaves the buffer as soon as its object
+  // is written, so a run that dies part-way keeps its progress and the next run resumes.
+  page: for (;;) {
+    const rows = (
+      await env.DB.prepare('SELECT id, session, day, payload FROM tool_calls WHERE day < ? ORDER BY day, session, id LIMIT ?')
+        .bind(today, ROLLUP_PAGE).all()
+    ).results;
+    if (!rows.length) break;
+    const groups = new Map();
+    for (const r of rows) {
+      const k = `${r.day}/${r.session}`;
+      if (!groups.has(k)) groups.set(k, { day: r.day, session: r.session, lines: [], maxId: 0 });
+      const g = groups.get(k);
+      g.lines.push(r.payload);
+      g.maxId = Math.max(g.maxId, r.id);
+    }
+    for (const [k, g] of groups) {
+      if (objects >= ROLLUP_MAX_GROUPS) { more = true; break page; }
+      const key = `tool-calls/${k}.jsonl`;
+      // R2 has no append; a session that spanned a roll-up boundary already has
+      // an object, so read it back and rewrite. These are tens of KB.
+      const prev = await env.LOGS.get(key);
+      const head = prev ? (await prev.text()).replace(/\n*$/, '\n') : '';
+      await env.LOGS.put(key, `${head}${g.lines.join('\n')}\n`, {
+        httpMetadata: { contentType: 'application/x-ndjson' },
+      });
+      await env.DB.prepare('DELETE FROM tool_calls WHERE day = ? AND session = ? AND id <= ?').bind(g.day, g.session, g.maxId).run();
+      rolled += g.lines.length;
+      objects++;
+    }
+    if (rows.length < ROLLUP_PAGE) break;
   }
-  for (const [k, lines] of groups) {
-    const key = `tool-calls/${k}.jsonl`;
-    // R2 has no append; a session that spanned a roll-up boundary already has
-    // an object, so read it back and rewrite. These are tens of KB.
-    const prev = await env.LOGS.get(key);
-    const head = prev ? (await prev.text()).replace(/\n*$/, '\n') : '';
-    await env.LOGS.put(key, `${head}${lines.join('\n')}\n`, {
-      httpMetadata: { contentType: 'application/x-ndjson' },
-    });
-  }
-  await env.DB.prepare('DELETE FROM tool_calls WHERE day < ?').bind(today).run();
-  return { rolled: rows.length, objects: groups.size };
+  return { rolled, objects, ...(more ? { more: true } : {}) };
 }
 
 /** Roll up and stamp the result, so /health reports the last drain either way. */
 async function recordRollup(env) {
-  const r = await rollUpToolCalls(env);
-  await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_rollup', ?)")
+  const stamp = (r) => env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('last_rollup', ?)")
     .bind(JSON.stringify({ at: new Date().toISOString(), ...r })).run();
+  let r;
+  try {
+    r = await rollUpToolCalls(env);
+  } catch (e) {
+    await stamp({ ok: false, error: String(e.message).slice(0, 200) }).catch(() => {});
+    throw e;
+  }
+  await stamp(r);
   return r;
 }
 
@@ -785,14 +888,17 @@ export default {
       const p = await getPrincipal(req, env);
       if (!p) return new Response('unauthorized', { status: 401 });
       try {
-        const tar = await fetchRepoTar(env);
+        const tar = await repoTar(env);
         const files = [];
         const skillNames = new Set();
+        let unsafe = 0;
         for (const e of tarEntries(tar)) {
           if (!e.path.startsWith('skills/') || e.path.endsWith('/.skillsync')) continue;
           if (!allowed(p, e.path)) continue;
           const rel = e.path.slice('skills/'.length);
           if (!rel || rel === 'mappings.yaml') continue;
+          // file names reach the shell; anything outside plain segments is not installed
+          if (!SAFE_REL.test(rel) || safeRepoPath(rel) === null) { unsafe++; continue; }
           files.push({ rel, body: e.text() });
           skillNames.add(rel.split('/')[0]);
         }
@@ -806,14 +912,15 @@ export default {
         ];
         for (const f of files) {
           const dir = f.rel.slice(0, f.rel.lastIndexOf('/'));
-          if (dir) lines.push(`mkdir -p "$SKILLS_DEST/${dir}"`);
-          lines.push(`base64 $B64D > "$SKILLS_DEST/${f.rel}" <<'B64_EOF'`, encodeBase64(f.body), 'B64_EOF');
-          if (f.rel.endsWith('.sh')) lines.push(`chmod +x "$SKILLS_DEST/${f.rel}"`);
+          if (dir) lines.push(`mkdir -p "$SKILLS_DEST"/${shq(dir)}`);
+          lines.push(`base64 $B64D > "$SKILLS_DEST"/${shq(f.rel)} <<'B64_EOF'`, encodeBase64(f.body), 'B64_EOF');
+          if (f.rel.endsWith('.sh')) lines.push(`chmod +x "$SKILLS_DEST"/${shq(f.rel)}`);
         }
-        lines.push(`echo "Done: ${[...skillNames].sort().join(' ')}"`, '');
+        if (unsafe) lines.push(`echo ${shq(`Skipped ${unsafe} file(s) with unsafe names`)} >&2`);
+        lines.push(`echo ${shq(`Done: ${[...skillNames].sort().join(' ')}`)}`, '');
         return new Response(lines.join('\n'), { headers: { 'Content-Type': 'text/x-shellscript; charset=utf-8' } });
       } catch (e) {
-        return new Response(`echo "install.sh generation failed: ${e.message}" >&2; exit 1\n`, { status: 500, headers: { 'Content-Type': 'text/x-shellscript' } });
+        return new Response(`echo ${shq(`install.sh generation failed: ${e.message}`)} >&2; exit 1\n`, { status: 500, headers: { 'Content-Type': 'text/x-shellscript' } });
       }
     }
 
@@ -835,7 +942,7 @@ export default {
 
     if (url.pathname === '/admin/rollup' && req.method === 'POST') {
       const p = await getPrincipal(req, env);
-      if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
+      if (!isRootAdmin(p)) return new Response('unauthorized', { status: 401 });
       try {
         const r = await recordRollup(env);
         return Response.json({ ok: true, ...r });
@@ -859,10 +966,10 @@ export default {
 
     if (url.pathname === '/admin/reindex' && req.method === 'POST') {
       const p = await getPrincipal(req, env);
-      if (!isAdmin(p)) return new Response('unauthorized', { status: 401 });
+      if (!isRootAdmin(p)) return new Response('unauthorized', { status: 401 });
       try {
-        const n = await fullReindex(env);
-        return Response.json({ ok: true, indexed: n });
+        const r = await fullReindex(env);
+        return Response.json({ ok: true, indexed: r.indexed, skipped: r.skipped.slice(0, 50) });
       } catch (e) {
         return Response.json({ ok: false, error: e.message }, { status: 500 });
       }
@@ -881,9 +988,13 @@ export default {
       }
       let body;
       try { body = await req.json(); } catch { return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 }); }
+      if (Array.isArray(body) && (!body.length || body.length > RPC_BATCH_CAP)) {
+        return Response.json(rpcError(null, -32600, `batch must hold 1-${RPC_BATCH_CAP} messages`), { status: 400 });
+      }
       const msgs = Array.isArray(body) ? body : [body];
       const replies = [];
       for (const m of msgs) {
+        if (!m || typeof m !== 'object' || Array.isArray(m)) { replies.push(rpcError(null, -32600, 'invalid request')); continue; }
         const r = await handleRpc(env, m, principal);
         if (r !== null && m.id !== undefined) replies.push(r);
       }
@@ -896,7 +1007,12 @@ export default {
 
   async scheduled(event, env, ctx) {
     const work = async () => {
-      await fullReindex(env);
+      // a failed rebuild keeps the previous index; still take the snapshot and drain telemetry
+      try {
+        await fullReindex(env);
+      } catch (e) {
+        console.log('nightly reindex failed:', e.message);
+      }
       // hygiene snapshot over the whole brain (unscoped), surfaced by /health
       const hygiene = await computeHygiene(env, { role: 'admin', prefixes: [] });
       await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('hygiene', ?)")
@@ -909,6 +1025,6 @@ export default {
         console.log('tool-call rollup failed:', e.message);
       }
     };
-    ctx.waitUntil(work().catch((e) => console.log('nightly reindex failed:', e.message)));
+    ctx.waitUntil(work().catch((e) => console.log('nightly job failed:', e.message)));
   },
 };

@@ -414,3 +414,15 @@ test('src/skills.js:readSkillsConfig:mappings-returned-without-scope-check: list
   assert.ok(!JSON.stringify(r).includes('secret-deal'));
   assert.deepEqual((await tool(env, root(env), 'list_skills')).mappings.map((m) => m.project), ['default', 'alpha', 'secret-deal']);
 });
+
+test('search and list_notes folder filters match long folder paths exactly, with no LIKE wildcards', async () => {
+  const long = 'vault/projects/a-very-long-project-folder-name-for-d1-limits/notes_100%/';
+  const { env } = await setup({ indexed: {
+    [`${long}x.md`]: '---\ntype: note\n---\nzebra marmot\n',
+    'vault/projects/a-very-long-project-folder-name-for-d1-limits/notesX100Z/y.md': '---\ntype: note\n---\nzebra marmot\n',
+  } });
+  const listed = await tool(env, root(env), 'list_notes', { folder: long });
+  assert.deepEqual(listed.notes.map((n) => n.path), [`${long}x.md`]);
+  const found = await tool(env, root(env), 'search', { q: 'marmot', folder: long });
+  assert.deepEqual(found.results.map((r) => r.path), [`${long}x.md`]);
+});

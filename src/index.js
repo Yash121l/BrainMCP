@@ -87,8 +87,9 @@ const nowDate = () => new Date().toISOString().slice(0, 10);
 const nowTime = () => new Date().toISOString().slice(11, 19).replace(/:/g, '');
 const randId = (n = 4) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join('');
 
-/** The <date>_<time> part of a session log filename, as a GLOB. */
-const SESS_DATE_GLOB = '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]';
+/** Is this the canonical log file vault/logs/sessions/YYYY-MM-DD_HHMMSS_<sessId>.md? */
+const sessionLogPath = (path, sessId) =>
+  new RegExp(`^vault/logs/sessions/\\d{4}-\\d{2}-\\d{2}_\\d{6}_${sessId}\\.md$`).test(path);
 /** Sanitize a client-supplied session id down to something safe in a filename. */
 const sessionKey = (v) => String(v || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
 
@@ -463,7 +464,7 @@ async function callTool(env, name, args = {}, p) {
       const binds = [ftsQuery(args.q)];
       if (args.type) { sql += ' AND n.type = ?'; binds.push(args.type); }
       if (args.project) { sql += ' AND n.project = ?'; binds.push(normalizeProject(args.project)); }
-      if (args.folder) { sql += ' AND f.path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
+      if (args.folder) { const pre = String(args.folder).replace(/\/?$/, '/'); sql += ' AND substr(f.path, 1, length(?)) = ?'; binds.push(pre, pre); }
       // Session logs and activity mirrors are ~80% of the vault. They swamp
       // knowledge notes in FTS ranking, so they are opt-in.
       if (!args.include_logs && !args.type && !args.folder) {
@@ -499,7 +500,7 @@ async function callTool(env, name, args = {}, p) {
       if (args.type) { sql += ' AND type = ?'; binds.push(args.type); }
       if (args.status) { sql += ' AND status = ?'; binds.push(args.status); }
       if (args.project) { sql += ' AND project = ?'; binds.push(normalizeProject(args.project)); }
-      if (args.folder) { sql += ' AND path LIKE ?'; binds.push(args.folder.replace(/\/?$/, '/') + '%'); }
+      if (args.folder) { const pre = String(args.folder).replace(/\/?$/, '/'); sql += ' AND substr(n.path, 1, length(?)) = ?'; binds.push(pre, pre); }
       if (p.prefixes?.length) { sql += scopeSql('n.path'); binds.push(JSON.stringify(p.prefixes)); }
       sql += ' ORDER BY updated DESC, path DESC LIMIT ?';
       binds.push(limit);
@@ -581,10 +582,14 @@ async function callTool(env, name, args = {}, p) {
       // session_id from get_context we update that note in place, so saving
       // twice in one session yields one note, not two.
       // Only this session's own canonical log file qualifies; frontmatter is writable
-      // by any in-scope key, so it never picks the target. sessId is [A-Za-z0-9_-], no GLOB metacharacters.
+      // by any in-scope key, so it never picks the target. D1 caps LIKE/GLOB pattern length,
+      // so narrow by range and suffix in SQL and check the exact filename shape here.
       const sessId = sessionKey(args.session_id) || `cloud${randId(4)}`;
-      const prior = await env.DB.prepare('SELECT path FROM notes WHERE path GLOB ? ORDER BY path LIMIT 1')
-        .bind(`vault/logs/sessions/${SESS_DATE_GLOB}_${sessId}.md`).first();
+      const suffix = `_${sessId}.md`;
+      const candidates = (await env.DB.prepare(
+        "SELECT path FROM notes WHERE path >= 'vault/logs/sessions/' AND path < 'vault/logs/sessions0' AND substr(path, -length(?)) = ? ORDER BY path"
+      ).bind(suffix, suffix).all()).results;
+      const prior = candidates.find((r) => sessionLogPath(r.path, sessId));
       const sessPath = prior?.path || `vault/logs/sessions/${date}_${nowTime()}_${sessId}.md`;
       if (!allowed(p, sessPath)) return deny(`no write access to ${sessPath}`);
       files.push({

@@ -25,11 +25,19 @@ function bindable(v) {
 }
 const plain = (row) => (row ? { ...row } : null);
 
+// D1 rejects LIKE/GLOB patterns longer than 50 bytes; node:sqlite has no such limit.
+const D1_PATTERN_MAX = 50;
+
 export function fakeD1() {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec(SCHEMA);
 
   const statement = (sql, args = []) => {
+    if (/\b(LIKE|GLOB)\b/i.test(sql)) {
+      for (const a of args) {
+        if (typeof a === 'string' && Buffer.byteLength(a) > D1_PATTERN_MAX) throw new Error('D1_ERROR: LIKE or GLOB pattern too complex: SQLITE_ERROR');
+      }
+    }
     const exec = () => {
       const r = sqlite.prepare(sql).run(...args);
       return { success: true, results: [], meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };

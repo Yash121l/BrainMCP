@@ -65,7 +65,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
   created   TEXT,
   expires   TEXT,               -- NULL = never
   revoked   INTEGER DEFAULT 0,
-  last_used TEXT
+  last_used TEXT,
+  user_id   TEXT,
+  space_limit TEXT,
+  parent_key_id TEXT
 );
 
 -- Tool-call telemetry. Hooks POST redacted records to /ingest/tool-calls; the
@@ -80,7 +83,41 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   cwd     TEXT,
   project TEXT,
   tool    TEXT,
-  payload TEXT             -- the full redacted record as JSON
+  payload TEXT,            -- the full redacted record as JSON
+  user_id TEXT,
+  key_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_day     ON tool_calls (day);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls (session, id);
+
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, name TEXT, email_enc TEXT,
+  status TEXT NOT NULL DEFAULT 'active', is_super INTEGER NOT NULL DEFAULT 0,
+  can_invite INTEGER NOT NULL DEFAULT 0, quota_notes INTEGER NOT NULL DEFAULT 5000,
+  created_by TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS spaces (
+  id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, owner_id TEXT NOT NULL,
+  kind TEXT NOT NULL, backing TEXT NOT NULL, dek_wrapped TEXT, kek_version INTEGER,
+  status TEXT NOT NULL DEFAULT 'active', created TEXT);
+CREATE TABLE IF NOT EXISTS members (
+  space_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL, added_by TEXT, created TEXT,
+  accepted INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (space_id, user_id));
+CREATE INDEX IF NOT EXISTS idx_members_user ON members (user_id);
+CREATE TABLE IF NOT EXISTS shares (
+  id TEXT PRIMARY KEY, space_id TEXT NOT NULL, project TEXT NOT NULL, grantee_id TEXT NOT NULL,
+  role TEXT NOT NULL, expires TEXT, granted_by TEXT, created TEXT,
+  accepted INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (space_id, project, grantee_id));
+CREATE INDEX IF NOT EXISTS idx_shares_grantee ON shares (grantee_id);
+CREATE TABLE IF NOT EXISTS invites (
+  code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_by TEXT, exp TEXT NOT NULL, used_at TEXT);
+CREATE TABLE IF NOT EXISTS exports (
+  token_hash TEXT PRIMARY KEY, space_id TEXT NOT NULL, user_id TEXT NOT NULL, r2_key TEXT NOT NULL, exp TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor_user TEXT, actor_key TEXT, via TEXT,
+  action TEXT NOT NULL, outcome TEXT NOT NULL, space_id TEXT, target TEXT, subject_user TEXT,
+  detail TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events (actor_user, id);
+CREATE INDEX IF NOT EXISTS idx_audit_space ON audit_events (space_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_events (subject_user, id);

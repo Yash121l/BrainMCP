@@ -8,11 +8,12 @@
 //   stubFetch(handler)  -> replaces globalThis.fetch; records { method, url, headers, body } on `.calls`.
 //                          With no handler every request throws. Call `.restore()` when done.
 //   advanceClock(env, days) -> moves "now" forward by shifting stored api_keys/oauth timestamps back.
-//   sha256hex(s)        -> hex digest, as stored in key_hash / token_hash / code_hash.
 
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { SpaceDO } from '../../src/store.js';
+import { AuditDO } from '../../src/audit.js';
 
 const SCHEMA = readFileSync(new URL('../../schema.sql', import.meta.url), 'utf8');
 
@@ -97,8 +98,57 @@ export function fakeR2() {
   };
 }
 
-export function fakeEnv(overrides = {}) {
+export function fakeDOState() {
+  let db = new DatabaseSync(':memory:');
+  const storage = {
+    sql: {
+      exec(sql, ...args) {
+        const stmt = db.prepare(sql);
+        const reads = /^\s*(select|with|pragma)\b/i.test(sql) || /\breturning\b/i.test(sql);
+        let rows = [];
+        let changes = 0;
+        if (reads) rows = stmt.all(...args.map(bindable)).map(plain);
+        else changes = Number(stmt.run(...args.map(bindable)).changes);
+        return { toArray: () => rows, one: () => rows[0], rowsWritten: changes };
+      },
+    },
+    transactionSync(fn) {
+      db.exec('SAVEPOINT tx');
+      try {
+        const out = fn();
+        db.exec('RELEASE tx');
+        return out;
+      } catch (e) {
+        db.exec('ROLLBACK TO tx');
+        db.exec('RELEASE tx');
+        throw e;
+      }
+    },
+    async deleteAll() { db.close(); db = new DatabaseSync(':memory:'); },
+  };
+  return { storage, blockConcurrencyWhile: async (fn) => fn(), get sqlite() { return db; } };
+}
+
+export function fakeDONamespace(Cls, getEnv) {
+  const instances = new Map();
   return {
+    instances,
+    idFromName: (name) => ({ name, toString: () => name }),
+    get(id) {
+      return {
+        async fetch(url, init) {
+          if (!instances.has(id.name)) instances.set(id.name, new Cls(fakeDOState(), getEnv()));
+          return instances.get(id.name).fetch(new Request(url, init));
+        },
+      };
+    },
+  };
+}
+
+export const TEST_KEK = Buffer.alloc(32, 7).toString('base64');
+
+export function fakeEnv(overrides = {}) {
+  const env = {
     DB: fakeD1(),
     LOGS: fakeR2(),
     BRAIN_TOKEN: 'test-root-token-0000000000000000',
@@ -106,8 +156,12 @@ export function fakeEnv(overrides = {}) {
     BRANCH: 'main',
     GITHUB_TOKEN: 'test-github-token',
     WEBHOOK_SECRET: 'test-webhook-secret',
+    BRAIN_KEK: TEST_KEK,
     ...overrides,
   };
+  if (!('SPACES' in overrides)) env.SPACES = fakeDONamespace(SpaceDO, () => env);
+  if (!('AUDIT' in overrides)) env.AUDIT = fakeDONamespace(AuditDO, () => env);
+  return env;
 }
 
 export function fakeCtx() {

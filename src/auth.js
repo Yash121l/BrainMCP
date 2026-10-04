@@ -46,7 +46,7 @@ export function projectScopeSlug(scope) {
   return isProjectSlug(slug) ? slug : null;
 }
 
-const ROLES = ['read', 'write', 'admin'];
+const ROLES = ['read', 'write', 'admin', 'super'];
 
 /** Clean a scope list from the API: trimmed, de-duplicated, no empties. */
 export function normalizeScopes(input) {
@@ -68,14 +68,14 @@ export function normalizeScopes(input) {
  * filed under that project. Expanding per request (rather than at key creation)
  * means notes added to the project later are covered without re-issuing the key.
  */
-export async function expandScopes(env, scopes) {
+export async function expandScopes(db, scopes) {
   const slugs = [...new Set(scopes.map(projectScopeSlug).filter(Boolean))];
   if (!slugs.length) return scopes;
 
   const prefixes = scopes.filter((s) => !projectScopeSlug(s));
   for (const slug of slugs) prefixes.push(`vault/projects/${slug}.md`, `vault/projects/${slug}/`);
   const marks = slugs.map(() => '?').join(',');
-  const rows = await env.DB.prepare(`SELECT path FROM notes WHERE project IN (${marks})`)
+  const rows = await db.prepare(`SELECT path FROM notes WHERE project IN (${marks})`)
     .bind(...slugs)
     .all()
     .catch(() => ({ results: [] }));
@@ -100,9 +100,31 @@ export async function rootKeyId(env) {
 export async function parentKey(env, keyId) {
   if (!keyId) return null;
   if (keyId === (await rootKeyId(env))) return { role: 'admin', scopes: [], expires: null };
-  const k = await env.DB.prepare(`SELECT k.role, k.prefixes, k.expires FROM api_keys k WHERE k.id = ? AND ${LIVE_KEY}`)
-    .bind(keyId).first().catch(() => null);
-  return k ? { role: k.role, scopes: JSON.parse(k.prefixes || '[]'), expires: k.expires || null } : null;
+  const k = await env.DB.prepare(
+    `SELECT k.role, k.prefixes, k.expires FROM api_keys k LEFT JOIN users u ON u.id = k.user_id
+     WHERE k.id = ? AND ${LIVE_KEY} AND (k.user_id IS NULL OR u.status = 'active')`
+  ).bind(keyId).first().catch(() => null);
+  return k ? { role: roleWithoutSuper(k.role), scopes: JSON.parse(k.prefixes || '[]'), expires: k.expires || null } : null;
+}
+
+export const roleWithoutSuper = (role) => (role === 'super' ? 'admin' : role);
+
+const superUser = (env) => env.DB.prepare('SELECT * FROM users WHERE is_super = 1 ORDER BY created LIMIT 1').first().catch(() => null);
+
+async function withUser(env, p, userId, spaceLimit) {
+  const user = userId
+    ? await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first().catch(() => null)
+    : await superUser(env);
+  if ((userId && !user) || (user && user.status !== 'active')) return null;
+  const isSuper = !!user?.is_super && (p.via === 'root' || (p.via === 'key' && p.role === 'super'));
+  return {
+    ...p,
+    role: p.via === 'key' && p.role === 'super' && !isSuper ? 'admin' : p.role,
+    user: user || null,
+    legacy: !userId,
+    spaceLimit: spaceLimit ? JSON.parse(spaceLimit) : null,
+    super: isSuper,
+  };
 }
 
 /**
@@ -116,29 +138,31 @@ export async function parentKey(env, keyId) {
 export async function resolvePrincipal(env, token) {
   if (!token) return null;
   if (timingSafeEq(token, env.BRAIN_TOKEN)) {
-    return { role: 'admin', scopes: [], prefixes: [], via: 'root', name: 'root', keyId: await rootKeyId(env), expires: null };
+    return withUser(env, { role: 'admin', scopes: [], prefixes: [], via: 'root', name: 'root', keyId: await rootKeyId(env), expires: null }, null, null);
   }
 
   const hash = await sha256hex(token);
 
   const key = await env.DB.prepare(
-    "SELECT id, name, role, prefixes, expires FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
+    "SELECT id, name, role, prefixes, expires, user_id, space_limit FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
   ).bind(hash).first().catch(() => null);
   if (key) {
     await env.DB.prepare("UPDATE api_keys SET last_used = datetime('now') WHERE id = ?").bind(key.id).run().catch(() => {});
     const scopes = JSON.parse(key.prefixes || '[]');
-    return { role: key.role, scopes, prefixes: await expandScopes(env, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null };
+    return withUser(env, { role: key.role, scopes, prefixes: await expandScopes(env.DB, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null },
+      key.user_id, key.space_limit);
   }
 
   // A session / connector token is only as alive as its parent: the current root
   // generation, or a managed key that still exists, is not revoked and has not expired.
   const tok = await env.DB.prepare(
-    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.expires AS key_expires FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
+    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.expires AS key_expires, k.user_id, k.space_limit FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
      WHERE t.token_hash = ? AND t.kind = 'access' AND t.exp > datetime('now') AND (t.key_id = ? OR (${LIVE_KEY}))`
   ).bind(hash, await rootKeyId(env)).first().catch(() => null);
   if (tok) {
     const scopes = JSON.parse(tok.prefixes || '[]');
-    return { role: tok.role || 'admin', scopes, prefixes: await expandScopes(env, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null };
+    return withUser(env, { role: roleWithoutSuper(tok.role || 'read'), scopes, prefixes: await expandScopes(env.DB, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null },
+      tok.user_id || null, tok.space_limit || null);
   }
 
   return null;
@@ -153,30 +177,44 @@ export function allowed(p, path) {
   if (!p.prefixes || p.prefixes.length === 0) return true;
   return p.prefixes.some((pre) => (pre.endsWith('/') ? path.startsWith(pre) : path === pre || path.startsWith(pre + '/')));
 }
-export const canWrite = (p) => !!p && (p.role === 'write' || p.role === 'admin');
-export const isAdmin = (p) => !!p && p.role === 'admin';
-/** Whole-brain admin (root token or an unscoped admin key): key management, reindex, rollup. */
-export const isRootAdmin = (p) => isAdmin(p) && (!p.scopes || p.scopes.length === 0);
+export const canWrite = (p) => !!p && (p.role === 'write' || p.role === 'admin' || p.role === 'super');
+
+export const isBindingPath = (path) =>
+  path === 'vault/skills.md' || path.startsWith('vault/rules/') || path.startsWith('skills/');
+
+export function canWritePath(p, path) {
+  if (!canWrite(p) || !allowed(p, path)) return false;
+  if (isBindingPath(path) && p.publish === false) return false;
+  if (p.writePrefixes && !(p.writePrefixes.length && allowed({ prefixes: p.writePrefixes }, path))) return false;
+  if (!isBindingPath(path) || !p.scopes?.length) return true;
+  const explicitPathScopes = p.scopes.filter((s) => !projectScopeSlug(s));
+  return explicitPathScopes.length > 0 && allowed({ prefixes: explicitPathScopes }, path);
+}
+export const isAdmin = (p) => !!p && (p.role === 'admin' || p.role === 'super');
+export const isRootAdmin = (p) => isAdmin(p) && (!p.scopes || p.scopes.length === 0) && (!p.user || !!p.user.is_super) && !p.spaceLimit;
 
 // Admin is a whole-brain role; a scoped admin could otherwise mint itself out of its scope.
 function checkGrant(role, scopes) {
-  if (role === 'admin' && scopes.length) throw new Error('admin keys cannot be scoped; use write for a scoped key');
+  if ((role === 'admin' || role === 'super') && scopes.length) throw new Error('admin keys cannot be scoped; use write for a scoped key');
 }
 
 const expiresSql = (days) =>
   days == null || days === '' ? 'NULL' : `datetime('now', '+${Math.max(1, Math.min(3650, Number(days) | 0))} days')`;
 
 /** Create a key. Returns { id, key } — the plaintext key is shown exactly once. */
-export async function createKey(env, { name, role = 'read', prefixes = [], expires_days = null }) {
-  if (!ROLES.includes(role)) throw new Error('role must be read|write|admin');
+export async function createKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null }) {
+  if (!ROLES.includes(role)) throw new Error('role must be read|write|admin|super');
+  if (role === 'super' && (expires_days == null || expires_days === '')) expires_days = 7;
+  if (role === 'super' && Number(expires_days) > 7) throw new Error('super keys expire within 7 days');
   const scopes = normalizeScopes(prefixes);
   checkGrant(role, scopes);
   const id = 'k_' + randToken(6);
   const key = 'bk_' + randToken(24);
   await env.DB.prepare(
-    `INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked)
-     VALUES (?, ?, ?, ?, ?, datetime('now'), ${expiresSql(expires_days)}, 0)`
-  ).bind(id, await sha256hex(key), String(name || id), role, JSON.stringify(scopes)).run();
+    `INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked, user_id, space_limit, parent_key_id)
+     VALUES (?, ?, ?, ?, ?, datetime('now'), ${expires_at ? 'datetime(?)' : expiresSql(expires_days)}, 0, ?, ?, ?)`
+  ).bind(...[id, await sha256hex(key), String(name || id).slice(0, 100), role, JSON.stringify(scopes), ...(expires_at ? [expires_at] : []),
+    user_id, space_limit ? JSON.stringify(space_limit) : null, parent_key_id]).run();
   return { id, key };
 }
 
@@ -203,7 +241,7 @@ export async function updateKey(env, id, patch = {}) {
     binds.push(name);
   }
   if (patch.role !== undefined) {
-    if (!ROLES.includes(patch.role)) throw new Error('role must be read|write|admin');
+    if (!ROLES.includes(patch.role) || patch.role === 'super') throw new Error('role must be read|write|admin');
     role = patch.role;
     sets.push('role = ?');
     binds.push(role);
@@ -221,7 +259,7 @@ export async function updateKey(env, id, patch = {}) {
   if (patch.role !== undefined || patch.prefixes !== undefined) {
     for (const table of ['oauth_tokens', 'oauth_codes']) {
       await env.DB.prepare(`UPDATE ${table} SET role = ?, prefixes = ? WHERE key_id = ?`)
-        .bind(role, JSON.stringify(scopes), id)
+        .bind(roleWithoutSuper(role), JSON.stringify(scopes), id)
         .run()
         .catch(() => {});
     }
@@ -230,20 +268,27 @@ export async function updateKey(env, id, patch = {}) {
 }
 
 const rowToKey = (k) => ({ ...k, prefixes: JSON.parse(k.prefixes || '[]') });
-const KEY_COLUMNS = 'id, name, role, prefixes, created, expires, revoked, last_used';
+const KEY_COLUMNS = 'k.id, k.name, k.role, k.prefixes, k.created, k.expires, k.revoked, k.last_used, k.user_id, u.handle AS owner';
+const KEY_FROM = 'api_keys k LEFT JOIN users u ON u.id = k.user_id';
 
 export async function getKey(env, id) {
-  const r = await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM api_keys WHERE id = ?`).bind(id).first();
+  const r = await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM ${KEY_FROM} WHERE k.id = ?`).bind(id).first();
   return r ? rowToKey(r) : null;
 }
 
-export async function listKeys(env) {
-  const r = await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM api_keys ORDER BY created DESC`).all();
+export async function listKeys(env, { userId } = {}) {
+  const r = userId
+    ? await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM ${KEY_FROM} WHERE k.user_id = ? ORDER BY k.created DESC`).bind(userId).all()
+    : await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM ${KEY_FROM} ORDER BY k.created DESC`).all();
   return r.results.map(rowToKey);
 }
 
-export async function revokeKey(env, id) {
+export async function revokeKey(env, id, seen = new Set()) {
+  if (seen.has(id)) return;
+  seen.add(id);
   await env.DB.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').bind(id).run();
+  const children = (await env.DB.prepare('SELECT id FROM api_keys WHERE parent_key_id = ? AND revoked = 0').bind(id).all().catch(() => ({ results: [] }))).results;
+  for (const c of children) await revokeKey(env, c.id, seen);
   // also kill every web session / connector token / pending consent code minted from this key
   await env.DB.prepare('DELETE FROM oauth_tokens WHERE key_id = ?').bind(id).run().catch(() => {});
   await env.DB.prepare('DELETE FROM oauth_codes WHERE key_id = ?').bind(id).run().catch(() => {});

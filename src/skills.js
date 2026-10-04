@@ -3,7 +3,7 @@
 // the Skills tab without index.js -> app.js -> index.js becoming a cycle.
 
 import { getFile } from './github.js';
-import { allowed } from './auth.js';
+import { allowed, sha256hex } from './auth.js';
 
 // vault/skills.md maps a project slug to its session skills. One line per row:
 //   default: !unslop, !no-comments, principle-prove-it-works
@@ -15,36 +15,51 @@ import { allowed } from './auth.js';
 
 const SKILLS_CONFIG_PATH = 'vault/skills.md';
 const SKILLS_RESERVED_KEYS = new Set(['type', 'title', 'updated', 'tags', 'status']);
+const PROJECT_SLUG = /^[a-z0-9][A-Za-z0-9._-]*$/;
+const ROW = new RegExp(`^(${PROJECT_SLUG.source.slice(1, -1)}):[ \\t]*(\\S.*)$`);
+const DEFAULT_REF = /^default(?=\s*(?:[+,]|$))/;
+
+function frontmatterEnd(lines) {
+  if (lines[0]?.trimEnd() !== '---') return 0;
+  const close = lines.findIndex((l, n) => n > 0 && l.trimEnd() === '---');
+  return close > 0 ? close + 1 : 0;
+}
+
+function scanRows(lines) {
+  const rows = [];
+  const seen = new Set();
+  let fenced = false;
+  for (let i = frontmatterEnd(lines); i < lines.length; i++) {
+    const line = lines[i].trimEnd();
+    if (/^(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = line.match(ROW);
+    if (!m || SKILLS_RESERVED_KEYS.has(m[1])) continue;
+    rows.push({ line: i, project: m[1], raw: m[2], duplicate: seen.has(m[1]) });
+    seen.add(m[1]);
+  }
+  return rows;
+}
 
 /** Parse skills.md into { header, entries: [{ project, raw }] } preserving prose above the rows. */
 export function parseSkillsConfig(text) {
   const lines = String(text || '').split('\n');
-  const entries = [];
-  const headerLines = [];
-  let seenRow = false;
-  for (const line of lines) {
-    const m = line.trimEnd().match(/^([a-z0-9-]+):[ \t]*(\S.*)$/);
-    if (m && !SKILLS_RESERVED_KEYS.has(m[1])) {
-      entries.push({ project: m[1], raw: m[2] });
-      seenRow = true;
-      continue;
-    }
-    if (!seenRow) headerLines.push(line);
-  }
-  return { header: headerLines.join('\n').replace(/\n+$/, ''), entries };
+  const rows = scanRows(lines);
+  const header = lines.slice(0, rows.length ? rows[0].line : lines.length).join('\n').replace(/\n+$/, '');
+  return { header, entries: rows.filter((r) => !r.duplicate).map(({ project, raw }) => ({ project, raw })) };
 }
 
 /** Expand one row's raw value into [{ name, must }], resolving `default + extras`. */
 function expandSkillRow(raw, defaultRaw) {
   let value = String(raw || '').trim();
   let inherits = false;
-  if (/^default\b/.test(value)) {
+  if (DEFAULT_REF.test(value)) {
     inherits = true;
-    const extras = value.slice('default'.length).replace(/^[\s+,]+/, '');
+    const extras = value.replace(DEFAULT_REF, '');
     value = [defaultRaw || '', extras].filter(Boolean).join(', ');
   }
   const out = [];
-  for (const part of value.split(',')) {
+  for (const part of value.split(/[,+]/)) {
     const token = part.trim();
     if (!token) continue;
     const must = token.startsWith('!');
@@ -77,42 +92,69 @@ export function skillsConfigEntries(text) {
       const { skills, inherits } = expandSkillRow(e.raw, defaultRaw);
       if (e.project === 'default' || !inherits) return { project: e.project, inherits_default: false, skills };
       // A `default + extras` row shows only its own extras; the inherited set is implied.
-      const own = expandSkillRow(e.raw.replace(/^default\b[\s+,]*/, ''), '').skills;
+      const own = expandSkillRow(e.raw.replace(DEFAULT_REF, ''), '').skills;
       return { project: e.project, inherits_default: true, skills: own };
     }),
   };
 }
 
-/** Render entries back to skills.md, keeping the original header prose. */
-export function renderSkillsConfig(header, entries) {
-  const rows = entries
-    .filter((e) => /^[a-z0-9-]+$/.test(String(e.project || '')))
-    // `default` first regardless of the order the caller sent, so a PUT
-    // round-trip never reshuffles the file.
-    .slice()
-    .sort((a, b) => (a.project === 'default' ? -1 : b.project === 'default' ? 1 : 0))
-    .map((e) => {
-      const names = (Array.isArray(e.skills) ? e.skills : [])
-        .filter((s) => s && /^[A-Za-z0-9._-]+$/.test(String(s.name || '')))
-        .map((s) => (s.must ? '!' : '') + s.name);
-      if (e.project !== 'default' && e.inherits_default) {
-        return `${e.project}: default${names.length ? ` + ${names.join(', ')}` : ''}`;
-      }
-      return `${e.project}: ${names.join(', ')}`;
-    });
-  return `${String(header || '').replace(/\n+$/, '')}\n\n${rows.join('\n\n')}\n`;
+const SKILL_NAME = /^[A-Za-z0-9._-]+$/;
+
+export function validateSkillEntries(entries) {
+  for (const e of entries) {
+    const project = String(e?.project ?? '');
+    if (!PROJECT_SLUG.test(project) || SKILLS_RESERVED_KEYS.has(project)) return `invalid project slug: ${JSON.stringify(project.slice(0, 80))}`;
+    for (const s of Array.isArray(e.skills) ? e.skills : []) {
+      if (!SKILL_NAME.test(String(s?.name ?? ''))) return `invalid skill name in ${project}: ${JSON.stringify(String(s?.name ?? '').slice(0, 80))}`;
+    }
+  }
+  if (new Set(entries.map((e) => e.project)).size !== entries.length) return 'each project may appear once';
+  const empty = entries.find((e) => !e.inherits_default && !(Array.isArray(e.skills) && e.skills.length));
+  if (empty) return `${empty.project} needs at least one skill or default`;
+  return null;
 }
 
-/** The skills library as { name, description } rows, scoped to the principal. */
-export async function skillCatalog(env, p) {
-  const res = await env.DB.prepare(
-    `SELECT path, json_extract(frontmatter, '$.name') AS name, json_extract(frontmatter, '$.description') AS description,
-            LENGTH(CAST(body AS BLOB)) AS bytes
-       FROM notes WHERE path LIKE 'skills/%/SKILL.md' ORDER BY path`
+function renderRow(e) {
+  const names = (Array.isArray(e.skills) ? e.skills : []).map((s) => (s.must ? '!' : '') + s.name);
+  if (e.project !== 'default' && e.inherits_default) return `${e.project}: default${names.length ? ` + ${names.join(', ')}` : ''}`;
+  return `${e.project}: ${names.join(', ')}`;
+}
+
+export function renderSkillsConfig(text, entries) {
+  const lines = String(text || '').replace(/\n+$/, '').split('\n');
+  const want = new Map(entries.map((e) => [e.project, e]));
+  const placed = new Set();
+  const drop = new Set();
+  let last = -1;
+  for (const r of scanRows(lines)) {
+    last = r.line;
+    const e = want.get(r.project);
+    if (!e || placed.has(r.project)) { drop.add(r.line); continue; }
+    lines[r.line] = renderRow(e);
+    placed.add(r.project);
+  }
+  const fresh = entries.filter((e) => !placed.has(e.project)).flatMap((e) => ['', renderRow(e)]);
+  const at = last === -1 ? lines.length : last + 1;
+  lines.splice(at, 0, ...fresh);
+  const out = [];
+  lines.forEach((l, i) => {
+    if (i < at && drop.has(i)) {
+      if (out.length && out[out.length - 1].trim() === '') out.pop();
+      return;
+    }
+    out.push(l);
+  });
+  return `${out.join('\n')}\n`;
+}
+
+export async function skillCatalog(db, readable) {
+  const res = await db.prepare(
+    `SELECT path, json_extract(frontmatter, '$.description') AS description, LENGTH(CAST(body AS BLOB)) AS bytes
+       FROM notes WHERE path >= 'skills/' AND path < 'skills0' AND path LIKE 'skills/%/SKILL.md' ORDER BY path`
   ).all();
   return res.results
-    .filter((r) => allowed(p, r.path))
-    .map((r) => ({ name: r.name || r.path.split('/')[1], description: r.description || '', bytes: r.bytes || 0 }));
+    .filter((r) => r.path.split('/').length === 3 && readable(r.path.split('/')[1], r.path))
+    .map((r) => ({ name: r.path.split('/')[1], description: r.description || '', bytes: r.bytes || 0 }));
 }
 
 /**
@@ -132,33 +174,61 @@ export async function readSkillsConfig(env) {
   return f?.content || '';
 }
 
-/**
- * The session skills payload for get_context: must-load bodies in full, the rest
- * by name, plus the whole catalogue so the agent can pull anything on demand.
- */
-export async function skillsPayload(env, p, slug) {
-  const [configText, catalog] = await Promise.all([readSkillsConfig(env), skillCatalog(env, p)]);
-  const applies = resolveSkillsFor(configText, slug);
-  const known = new Set(catalog.map((s) => s.name));
+export function skillLayer({ space, pv, db, config, rowSlug = null }) {
+  const applies = resolveSkillsFor(config, rowSlug);
+  const named = new Set(applies.map((s) => s.name));
+  return { space, pv, db, applies, boundOrAllowed: (name) => named.has(name) || allowed(pv, `skills/${name}/SKILL.md`) };
+}
+
+const clipDescription = (d) => (d.length > 200 ? `${d.slice(0, 200)}…` : d);
+
+export async function skillsPayload(layers) {
+  const applies = [];
+  for (const L of layers) {
+    for (const s of L.applies) {
+      const seen = applies.find((x) => x.name === s.name);
+      if (seen) seen.must = seen.must || s.must;
+      else applies.push({ ...s });
+    }
+  }
+  const catalogs = await Promise.all(layers.map((L) => skillCatalog(L.db, (name) => L.boundOrAllowed(name))));
+  const known = new Set(catalogs.flat().map((s) => s.name));
   const loaded = [];
   const missing = [];
+  const forbidden = [];
   for (const s of applies.filter((x) => x.must)) {
-    if (!allowed(p, `skills/${s.name}/SKILL.md`)) continue;
-    const r = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind(`skills/${s.name}/SKILL.md`).first();
-    if (r?.body) loaded.push({ name: s.name, body: r.body });
-    else missing.push(s.name);
+    const path = `skills/${s.name}/SKILL.md`;
+    let hit = null;
+    let blocked = false;
+    for (const L of layers) {
+      if (!L.boundOrAllowed(s.name)) { blocked = true; continue; }
+      const r = await L.db.prepare('SELECT body FROM notes WHERE path = ?').bind(path).first();
+      if (r?.body) { hit = { name: s.name, source: `@${L.space.handle}`, sha256: await sha256hex(r.body), body: r.body }; break; }
+    }
+    if (hit) loaded.push(hit);
+    else (blocked ? forbidden : missing).push(s.name);
   }
-  const byName = applies.filter((x) => !x.must).map((x) => x.name);
-  for (const n of byName) if (!known.has(n)) missing.push(n);
+  const byName = [];
+  for (const { name, must } of applies) {
+    if (must) continue;
+    if (known.has(name)) byName.push(name);
+    else if (layers.some((L) => L.boundOrAllowed(name))) missing.push(name);
+    else forbidden.push(name);
+  }
+  const inBody = new Set(loaded.map((s) => s.name));
+  const catalog = [];
+  for (const s of catalogs.flat()) {
+    if (!inBody.has(s.name) && !catalog.some((c) => c.name === s.name)) catalog.push({ name: s.name, description: clipDescription(s.description) });
+  }
   return {
     must_load: loaded,
     on_demand: byName,
     catalog,
     ...(missing.length ? { unresolved: missing } : {}),
+    ...(forbidden.length ? { forbidden } : {}),
     hint:
-      'must_load skills are BINDING for this session — apply them without being asked. on_demand skills are '
-      + 'binding too, but their bodies are not included: fetch each with get_skill before you start work that '
-      + 'it governs. catalog lists everything else available via get_skill.',
+      'Apply must_load skills for this whole session without being asked. Fetch each on_demand skill with '
+      + 'get_skill before work it governs. catalog lists the rest of the library. forbidden names skills this '
+      + 'session should use but your key cannot read.',
   };
 }
-

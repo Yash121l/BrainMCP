@@ -5,7 +5,8 @@
 // Any managed key (see auth.js) works on the consent page; issued tokens inherit
 // that key's role + path-prefix scopes. BRAIN_TOKEN stays as break-glass admin.
 
-import { resolvePrincipal, parentKey } from './auth.js';
+import { resolvePrincipal, parentKey, roleWithoutSuper } from './auth.js';
+import { auditInBackground } from './audit.js';
 
 const enc = new TextEncoder();
 
@@ -101,7 +102,7 @@ export async function validOauthToken(env, token) {
   return (await resolvePrincipal(env, token))?.via === 'oauth';
 }
 
-export async function handleOauth(req, env, url) {
+export async function handleOauth(req, env, url, ctx) {
   const origin = url.origin;
 
   if (url.pathname === '/.well-known/oauth-authorization-server') {
@@ -175,7 +176,8 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
     await env.DB.prepare(
       "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, challenge, exp, role, prefixes, key_id) VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'), ?, ?, ?)"
     ).bind(await sha256hex(code), checked.client.client_id, checked.redirect_uri, get('code_challenge'),
-           principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId).run();
+           roleWithoutSuper(principal.role), JSON.stringify(principal.scopes ?? []), principal.keyId).run();
+    auditInBackground({ env, ctx, p: principal }, 'oauth.consent', { detail: { client: checked.client.client_id, host: dest.host } });
     dest.searchParams.set('code', code);
     if (get('state')) dest.searchParams.set('state', get('state'));
     return Response.redirect(dest.toString(), 302);

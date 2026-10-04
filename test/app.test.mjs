@@ -68,7 +68,7 @@ test('src/app.js:computeHygiene:broken-link-resolution-against-unscoped-notes: o
   assert.equal(chk.body.counts.links, 4);
 
   // the unscoped view still resolves everything that exists
-  const root = await computeHygiene(env, { role: 'admin', scopes: [], prefixes: [] });
+  const root = await computeHygiene(env.DB, { role: 'admin', scopes: [], prefixes: [] });
   assert.deepEqual(root.broken_links.map((b) => b.dst), ['topics/ghost-plan']);
   assert.equal(root.counts.notes, 4);
 });

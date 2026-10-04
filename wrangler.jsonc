@@ -22,7 +22,9 @@
       "/register",
       "/.well-known/*",
       "/health",
-      "/skills/*"
+      "/skills/*",
+      "/invite/*",
+      "/export/*"
     ]
   },
   // brain.yashlunawat.com is attached as a Workers custom domain in the dashboard.
@@ -34,8 +36,22 @@
   "preview_urls": false,
   "vars": {
     "REPO": "Yash121l/brain",
-    "BRANCH": "main"
+    "BRANCH": "main",
+    "SUPER_HANDLE": "yash"
   },
+  "durable_objects": {
+    "bindings": [
+      { "name": "SPACES", "class_name": "SpaceDO" },
+      { "name": "AUDIT", "class_name": "AuditDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SpaceDO", "AuditDO"] }
+  ],
+  "ratelimits": [
+    { "name": "MCP_LIMITER", "namespace_id": "4101", "simple": { "limit": 300, "period": 60 } },
+    { "name": "AUTH_LIMITER", "namespace_id": "4102", "simple": { "limit": 20, "period": 60 } }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

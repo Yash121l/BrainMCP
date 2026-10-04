@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrainMCP for many people: proposal</title>
+<style>
+  :root {
+    --bg: #fafaf9; --fg: #1c1917; --muted: #57534e; --line: #d6d3d1; --card: #ffffff;
+    --blue: #2563eb; --blue-bg: #eff6ff; --green: #15803d; --green-bg: #f0fdf4;
+    --amber: #b45309; --amber-bg: #fffbeb; --violet: #6d28d9; --violet-bg: #f5f3ff;
+    --red: #b91c1c; --red-bg: #fef2f2; --code: #f5f5f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0a09; --fg: #e7e5e4; --muted: #a8a29e; --line: #44403c; --card: #1c1917;
+      --blue: #60a5fa; --blue-bg: #172554; --green: #4ade80; --green-bg: #052e16;
+      --amber: #fbbf24; --amber-bg: #422006; --violet: #a78bfa; --violet-bg: #2e1065;
+      --red: #f87171; --red-bg: #450a0a; --code: #292524;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 34px; line-height: 1.2; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h2 { font-size: 24px; margin: 56px 0 12px; padding-top: 16px; border-top: 1px solid var(--line); letter-spacing: -0.01em; }
+  h3 { font-size: 18px; margin: 28px 0 8px; }
+  p, li { color: var(--fg); }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .meta { color: var(--muted); font-size: 14px; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 4px; font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: var(--code); padding: 14px 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 16px 0; }
+  .tldr { border-left: 4px solid var(--blue); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  figure { margin: 20px 0; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  figcaption { color: var(--muted); font-size: 14px; padding: 8px 6px 2px; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { fill: var(--fg); font: 13px ui-sans-serif, system-ui, sans-serif; }
+  svg .small { font-size: 11.5px; fill: var(--muted); }
+  svg .title { font-weight: 650; font-size: 14px; }
+  svg .mono { font: 11.5px ui-monospace, Menlo, monospace; fill: var(--fg); }
+  svg .box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+  svg .blue { fill: var(--blue-bg); stroke: var(--blue); stroke-width: 1.5; }
+  svg .green { fill: var(--green-bg); stroke: var(--green); stroke-width: 1.5; }
+  svg .amber { fill: var(--amber-bg); stroke: var(--amber); stroke-width: 1.5; }
+  svg .violet { fill: var(--violet-bg); stroke: var(--violet); stroke-width: 1.5; }
+  svg .red { fill: var(--red-bg); stroke: var(--red); stroke-width: 1.5; }
+  svg .zone { fill: none; stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 6 5; }
+  svg .arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#ah); }
+  svg .lane { stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 4 4; }
+  svg .rel { stroke: var(--muted); stroke-width: 1.3; fill: none; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14.5px; background: var(--card); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--code); font-weight: 600; }
+  td.y { color: var(--green); font-weight: 600; }
+  td.n { color: var(--muted); }
+  td.p { color: var(--amber); font-weight: 600; }
+  .pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .sev-h { color: var(--red); font-weight: 600; }
+  .sev-m { color: var(--amber); font-weight: 600; }
+  .sev-l { color: var(--muted); font-weight: 600; }
+  .q { border-left: 4px solid var(--amber); }
+  nav ol { columns: 2; color: var(--muted); }
+  @media (max-width: 760px) { nav ol { columns: 1; } }
+  a { color: var(--blue); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>BrainMCP for many people</h1>
+<p class="sub">A proposal to turn one person's brain into a system where every person gets their own brain, shares parts of it with others, and works only through MCP. Yash stays super admin and is also an ordinary user.</p>
+<p class="meta">Approved and built · 2026-10-05 · repo <code>Yash121l/BrainMCP</code></p>
+
+<div class="card tldr">
+  <h3 style="margin-top:0">Short version</h3>
+  <ul>
+    <li>Today a key is a slice of <em>your</em> brain. A friend with a key can read or write the paths you picked, but has no brain of their own and can't create projects, keys or shares without an admin key.</li>
+    <li>The fix is to add people as a first-class idea. A <b>user</b> owns one or more <b>spaces</b>. A space is a brain with its own projects, notes, decisions, sessions, skills and rules. Everyone gets a personal space. Spaces and single projects can be shared with other users as viewer or editor.</li>
+    <li>Every key belongs to a user and can never do more than that user. Users mint and revoke their own keys, create projects and share them through new MCP tools, so nobody needs your admin key again.</li>
+    <li>Each space lives in its own Durable Object with its own SQLite database. Two people's notes are never rows in the same table, so a missed <code>WHERE</code> clause can't leak one person's brain into another's.</li>
+    <li>Your brain stays exactly where it is, git-backed in <code>Yash121l/brain</code>. Friends' spaces are hosted. Their notes never land in your GitHub repo or on your Mac.</li>
+    <li>Only a space's owner or admins can publish content that binds an agent: skills, <code>skills.md</code>, rules. Everything else an agent reads is labelled as data with its author. That closes the main prompt-injection path once other people can write.</li>
+    <li>Every write, share, key change, denied request and super-admin access goes into a hash-chained audit log. You can see everything. Each user can see their own trail, including any time you looked at their data.</li>
+  </ul>
+</div>
+
+<div class="card" style="border-left:4px solid var(--green)">
+  <h3 style="margin-top:0">Status, 2026-10-05: built and deployed</h3>
+  <p>Phases 0 to 3 and most of phase 4 are live. Where the build differs from this page:</p>
+  <ul>
+    <li>Your <code>@yash</code> space keeps its index in the existing D1 tables instead of moving to a Durable Object. No other user's notes are in D1, so the isolation argument still holds, and your index, reindex and webhook paths stay exactly as they were.</li>
+    <li>Not built yet: passkeys for the web UI and OAuth consent, the GitHub App swap (it needs you to create the app in GitHub), and an R2 retention lock on the audit archive (a bucket setting in the dashboard). Daily audit archives to R2 and the hash chain itself are live.</li>
+  </ul>
+</div>
+
+<nav class="card">
+  <b>Contents</b>
+  <ol>
+    <li><a href="#today">What exists today</a></li>
+    <li><a href="#concepts">Concepts</a></li>
+    <li><a href="#arch">Architecture</a></li>
+    <li><a href="#model">Data model</a></li>
+    <li><a href="#authz">Permissions</a></li>
+    <li><a href="#flows">Flows</a></li>
+    <li><a href="#skills">Skills and prompt injection</a></li>
+    <li><a href="#security">Security and encryption</a></li>
+    <li><a href="#tools">New MCP tools</a></li>
+    <li><a href="#eval">Skill evaluation results</a></li>
+    <li><a href="#phases">Build phases</a></li>
+    <li><a href="#questions">Decisions I need from you</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ 1 -->
+<h2 id="today">1. What exists today</h2>
+<p>One Worker, one D1 index, one GitHub repo, one owner. Keys carry a role (read, write, admin) and a list of path prefixes or <code>project:&lt;slug&gt;</code> scopes. It works well for one person across many machines and many projects. It breaks down for a second person in four places.</p>
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Where it breaks for a second person</h3>
+    <ol>
+      <li>A friend has no brain of their own. Anything they write lands inside your vault, under paths you had to pre-authorize.</li>
+      <li>Creating a project, minting a key, or changing scopes needs an unscoped admin key, which is your whole brain.</li>
+      <li>There is one <code>skills.md</code>, one <code>decisions.md</code> and one <code>default</code> skill row for everyone. Anyone with write access to those paths changes what every session treats as binding.</li>
+      <li>No record of who did what. Commits are all authored by the Worker's GitHub token.</li>
+    </ol>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">What is already solid and stays</h3>
+    <ul>
+      <li>Hashed keys with lineage: sessions and OAuth tokens die with their parent key, and narrowing a key narrows its tokens.</li>
+      <li>Canonical-path checks, SQL-side scope filters, PKCE S256 only, exact redirect URIs.</li>
+      <li>git as source of truth for your brain, with D1 as a rebuildable index.</li>
+      <li>The one-call <code>save</code> and <code>get_context</code> bootstrap.</li>
+      <li>48 passing tests on a node:sqlite fake D1, which the new permission tests extend.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ 2 -->
+<h2 id="concepts">2. Concepts</h2>
+<table>
+  <tr><th style="width:150px">Term</th><th>Meaning</th><th style="width:230px">Example</th></tr>
+  <tr><td>User</td><td>A person. Has a handle, a status (active, suspended, deleted) and optional flags. One user, you, has the super-admin flag.</td><td><code>@yash</code>, <code>@priya</code></td></tr>
+  <tr><td>Space</td><td>A brain. Holds projects, topics, sessions, decisions, skills, rules. Every user gets a personal space on signup. Users can also create team spaces with several members.</td><td><code>@yash</code>, <code>@priya</code>, <code>@rtp-india</code></td></tr>
+  <tr><td>Backing</td><td>Where a space's source of truth lives. <code>git</code> means a GitHub repo, which is your current setup. <code>hosted</code> means the space's own Durable Object, with encrypted snapshots in R2.</td><td><code>@yash</code> is git, <code>@priya</code> is hosted</td></tr>
+  <tr><td>Project</td><td>Same as today, a note at <code>vault/projects/&lt;slug&gt;.md</code> plus everything filed under it, now inside a space. The full name includes the space.</td><td><code>@yash/brainmcp</code></td></tr>
+  <tr><td>Member</td><td>A user's role in a whole space: owner, admin, editor or viewer.</td><td>Priya is editor of <code>@rtp-india</code></td></tr>
+  <tr><td>Share</td><td>A grant on one project, or one folder, of a space to one user, as viewer or editor, optionally expiring.</td><td><code>@yash/brainmcp</code> shared with <code>@priya</code> as editor until 2026-12-31</td></tr>
+  <tr><td>Key</td><td>A credential owned by one user. It has a cap (read, write, manage, or super) and an optional limit to some spaces or projects. What a key can do is always the smaller of its cap and its owner's live access.</td><td>Priya's laptop key: write, limited to <code>@priya</code></td></tr>
+  <tr><td>Audit event</td><td>One append-only, hash-chained record of an action, its actor, key, target and outcome.</td><td><code>share.create</code>, <code>note.write</code>, <code>super.read</code></td></tr>
+</table>
+<p>The rule that keeps this safe: <b>a key is a subset of a user, and a user's access is the union of their memberships and shares.</b> Revoke a share and every key and connector token that user holds loses it on the next request, because access is computed live, never copied onto the key.</p>
+
+<!-- ============================================================ 3 -->
+<h2 id="arch">3. Architecture</h2>
+<p>Two planes. The control plane is one D1 database that knows who exists and who may do what. The data plane is one Durable Object per space, each with its own SQLite database holding that space's notes, link graph and full-text index. The Worker in the middle is the only thing that talks to both, and every request goes through one authorize function before it reaches any space.</p>
+
+<figure>
+<svg viewBox="0 0 960 540" role="img" aria-label="Proposed architecture">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78716c"/></marker></defs>
+
+  <text x="20" y="30" class="title">Clients</text>
+  <rect x="20" y="45" width="175" height="48" rx="8" class="box"/><text x="32" y="66">Claude Code</text><text x="32" y="83" class="small">bearer key</text>
+  <rect x="20" y="105" width="175" height="48" rx="8" class="box"/><text x="32" y="126">claude.ai connector</text><text x="32" y="143" class="small">OAuth 2.1 + PKCE</text>
+  <rect x="20" y="165" width="175" height="48" rx="8" class="box"/><text x="32" y="186">Codex, other MCP</text><text x="32" y="203" class="small">bearer key</text>
+  <rect x="20" y="225" width="175" height="48" rx="8" class="box"/><text x="32" y="246">Web UI</text><text x="32" y="263" class="small">session cookie</text>
+
+  <rect x="232" y="45" width="122" height="228" rx="10" class="violet"/>
+  <text x="244" y="70" class="title">Cloudflare</text>
+  <text x="244" y="88" class="title">edge</text>
+  <text x="244" y="112" class="small">TLS 1.3, HSTS</text>
+  <text x="244" y="130" class="small">min TLS 1.2</text>
+  <text x="244" y="148" class="small">rate limits per</text>
+  <text x="244" y="164" class="small">key and per IP</text>
+  <text x="244" y="182" class="small">WAF</text>
+
+  <line x1="195" y1="69" x2="230" y2="100" class="arrow"/>
+  <line x1="195" y1="129" x2="230" y2="140" class="arrow"/>
+  <line x1="195" y1="189" x2="230" y2="180" class="arrow"/>
+  <line x1="195" y1="249" x2="230" y2="220" class="arrow"/>
+
+  <rect x="392" y="45" width="236" height="228" rx="10" class="blue"/>
+  <text x="404" y="70" class="title">BrainMCP Worker</text>
+  <text x="404" y="96">1. credential → user + key</text>
+  <text x="404" y="120">2. authorize(principal,</text>
+  <text x="420" y="138">action, resource)</text>
+  <text x="404" y="162">3. route to the space's DO</text>
+  <text x="404" y="186">4. write audit event</text>
+  <text x="404" y="218" class="small">MCP tools · OAuth · /app/api</text>
+  <text x="404" y="236" class="small">deny by default, one code path</text>
+  <line x1="354" y1="159" x2="390" y2="159" class="arrow"/>
+
+  <rect x="668" y="45" width="272" height="160" rx="10" class="amber"/>
+  <text x="680" y="70" class="title">Control plane · D1 brain-control</text>
+  <text x="680" y="96">users · spaces · members · shares</text>
+  <text x="680" y="120">api_keys · oauth_tokens · invites</text>
+  <text x="680" y="144">audit_events, hash-chained</text>
+  <text x="680" y="172" class="small">no note content lives here</text>
+  <text x="680" y="190" class="small">emails encrypted with the KEK</text>
+  <line x1="628" y1="125" x2="666" y2="125" class="arrow"/>
+
+  <rect x="392" y="320" width="548" height="200" rx="12" class="zone"/>
+  <text x="404" y="344" class="title">Data plane · one Durable Object with its own SQLite per space</text>
+
+  <rect x="404" y="362" width="122" height="96" rx="8" class="green"/>
+  <text x="414" y="384" class="title">@yash</text><text x="414" y="404" class="small">backing: git</text><text x="414" y="421" class="small">notes · links · fts</text><text x="414" y="438" class="small">index only</text>
+  <rect x="538" y="362" width="122" height="96" rx="8" class="green"/>
+  <text x="548" y="384" class="title">@priya</text><text x="548" y="404" class="small">backing: hosted</text><text x="548" y="421" class="small">notes · versions</text><text x="548" y="438" class="small">source of truth</text>
+  <rect x="672" y="362" width="122" height="96" rx="8" class="green"/>
+  <text x="682" y="384" class="title">@rtp-india</text><text x="682" y="404" class="small">team space</text><text x="682" y="421" class="small">hosted</text><text x="682" y="438" class="small">3 members</text>
+  <rect x="806" y="362" width="122" height="96" rx="8" class="violet"/>
+  <text x="816" y="384" class="title">@system</text><text x="816" y="404" class="small">curated skills</text><text x="816" y="421" class="small">read-only to all</text><text x="816" y="438" class="small">you publish</text>
+  <text x="404" y="494" class="small">each DO: 30-day point-in-time recovery, FTS5 search, one writer at a time</text>
+
+  <line x1="510" y1="273" x2="510" y2="318" class="arrow"/>
+
+  <rect x="20" y="360" width="200" height="60" rx="8" class="box"/>
+  <text x="32" y="383" class="title">GitHub · Yash121l/brain</text><text x="32" y="402" class="small">source of truth for @yash only</text>
+  <line x1="402" y1="392" x2="222" y2="392" class="arrow"/>
+  <text x="240" y="384" class="small">commits + webhook</text>
+
+  <rect x="20" y="440" width="200" height="72" rx="8" class="box"/>
+  <text x="32" y="463" class="title">R2</text><text x="32" y="482" class="small">encrypted space snapshots</text><text x="32" y="499" class="small">audit archive · telemetry</text>
+  <line x1="390" y1="476" x2="222" y2="476" class="arrow"/>
+</svg>
+<figcaption>Figure 1. Every request passes the same four steps in the Worker. Spaces are separate databases, so isolation does not depend on every query remembering a filter.</figcaption>
+</figure>
+
+<h3>Why a Durable Object per space instead of a <code>space_id</code> column in D1</h3>
+<p>The cheaper option is one D1 database with a <code>space_id</code> on every row. It would work, and today's code already filters every query by scope. But one forgotten filter in one future query leaks a person's brain to everyone, and that bug class is exactly what the last audit spent most of its time on. With a database per space, the Worker picks which database to open after authorization, and a query inside it can only ever see that space. The cost is a fan-out when someone searches across several spaces they can read, which is a handful of parallel calls for a few users. SQLite Durable Objects are on the Workers free plan (100k requests a day, 100k rows written a day, 5 GB stored in total), support FTS5, and keep 30 days of point-in-time recovery.</p>
+
+<h3>Your brain does not move</h3>
+<p><code>@yash</code> is a git-backed space bound to <code>Yash121l/brain</code>. GitHub stays the source of truth, Obsidian and the launchd sync keep working, and the webhook and nightly reindex now fill the <code>@yash</code> Durable Object instead of the shared D1 <code>notes</code> table. Friends' spaces are hosted, so their notes never pass through your repo, your GitHub token, or your Mac.</p>
+
+<!-- ============================================================ 4 -->
+<h2 id="model">4. Data model</h2>
+<figure>
+<svg viewBox="0 0 960 470" role="img" aria-label="Control plane tables">
+  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78716c"/></marker></defs>
+
+  <rect x="20" y="20" width="200" height="176" rx="8" class="amber"/>
+  <text x="32" y="44" class="title">users</text>
+  <text x="32" y="68" class="mono">id, handle</text>
+  <text x="32" y="88" class="mono">email_enc</text>
+  <text x="32" y="108" class="mono">status</text>
+  <text x="32" y="128" class="mono">is_super</text>
+  <text x="32" y="148" class="mono">can_invite</text>
+  <text x="32" y="168" class="mono">quota_notes, quota_mb</text>
+
+  <rect x="268" y="20" width="180" height="116" rx="8" class="amber"/>
+  <text x="280" y="44" class="title">members</text>
+  <text x="280" y="68" class="mono">space_id</text>
+  <text x="280" y="88" class="mono">user_id</text>
+  <text x="280" y="108" class="mono">role: owner|admin|</text>
+  <text x="280" y="124" class="mono">  editor|viewer</text>
+
+  <rect x="496" y="20" width="200" height="176" rx="8" class="amber"/>
+  <text x="508" y="44" class="title">spaces</text>
+  <text x="508" y="68" class="mono">id, handle</text>
+  <text x="508" y="88" class="mono">owner_id</text>
+  <text x="508" y="108" class="mono">backing: git|hosted</text>
+  <text x="508" y="128" class="mono">repo, branch</text>
+  <text x="508" y="148" class="mono">dek_wrapped</text>
+  <text x="508" y="168" class="mono">kek_version</text>
+
+  <rect x="744" y="20" width="196" height="176" rx="8" class="amber"/>
+  <text x="756" y="44" class="title">shares</text>
+  <text x="756" y="68" class="mono">id, space_id</text>
+  <text x="756" y="88" class="mono">project | folder</text>
+  <text x="756" y="108" class="mono">grantee_id</text>
+  <text x="756" y="128" class="mono">role: editor|viewer</text>
+  <text x="756" y="148" class="mono">expires</text>
+  <text x="756" y="168" class="mono">granted_by</text>
+
+  <rect x="20" y="250" width="200" height="196" rx="8" class="amber"/>
+  <text x="32" y="274" class="title">api_keys</text>
+  <text x="32" y="298" class="mono">id, user_id</text>
+  <text x="32" y="318" class="mono">key_hash</text>
+  <text x="32" y="338" class="mono">name</text>
+  <text x="32" y="358" class="mono">cap: read|write|</text>
+  <text x="32" y="374" class="mono">  manage|super</text>
+  <text x="32" y="394" class="mono">limits: [space/proj]</text>
+  <text x="32" y="414" class="mono">expires, revoked</text>
+  <text x="32" y="434" class="mono">last_used</text>
+
+  <rect x="268" y="250" width="180" height="136" rx="8" class="amber"/>
+  <text x="280" y="274" class="title">oauth_tokens</text>
+  <text x="280" y="298" class="mono">token_hash, kind</text>
+  <text x="280" y="318" class="mono">key_id</text>
+  <text x="280" y="338" class="mono">client_id</text>
+  <text x="280" y="358" class="mono">exp</text>
+  <text x="280" y="376" class="small">role and scopes now derived</text>
+
+  <rect x="496" y="250" width="200" height="136" rx="8" class="amber"/>
+  <text x="508" y="274" class="title">invites</text>
+  <text x="508" y="298" class="mono">code_hash</text>
+  <text x="508" y="318" class="mono">user_id</text>
+  <text x="508" y="338" class="mono">created_by</text>
+  <text x="508" y="358" class="mono">exp (72h), used_at</text>
+
+  <rect x="744" y="250" width="196" height="196" rx="8" class="amber"/>
+  <text x="756" y="274" class="title">audit_events</text>
+  <text x="756" y="298" class="mono">id, ts, request_id</text>
+  <text x="756" y="318" class="mono">actor_user, actor_key</text>
+  <text x="756" y="338" class="mono">via: mcp|ui|oauth</text>
+  <text x="756" y="358" class="mono">action, outcome</text>
+  <text x="756" y="378" class="mono">space_id, target</text>
+  <text x="756" y="398" class="mono">subject_user</text>
+  <text x="756" y="418" class="mono">prev_hash, hash</text>
+
+  <line x1="220" y1="78" x2="266" y2="78" class="rel"/><text x="226" y="70" class="small">1..n</text>
+  <line x1="448" y1="78" x2="494" y2="78" class="rel"/><text x="454" y="70" class="small">n..1</text>
+  <line x1="696" y1="108" x2="742" y2="108" class="rel"/><text x="702" y="100" class="small">1..n</text>
+  <line x1="120" y1="196" x2="120" y2="248" class="rel"/><text x="126" y="228" class="small">owns keys</text>
+  <line x1="220" y1="318" x2="266" y2="318" class="rel"/><text x="224" y="310" class="small">mints</text>
+  <path d="M220,150 C380,210 620,210 840,198" class="rel" stroke-dasharray="4 3"/><text x="520" y="222" class="small">grantee</text>
+</svg>
+<figcaption>Figure 2. Control-plane tables. Note content, links and the search index live in each space's Durable Object, never here.</figcaption>
+</figure>
+<p>Inside each space's Durable Object the tables are today's <code>notes</code>, <code>links</code> and <code>fts</code>, plus <code>note_versions</code> for hosted spaces, which gives them git-like history without git. Every note written by the server gets <code>author:</code> and <code>updated_by:</code> frontmatter that the server sets, so a client can't forge authorship.</p>
+
+<!-- ============================================================ 5 -->
+<h2 id="authz">5. Permissions</h2>
+<p>One function decides everything: <code>authorize(principal, action, resource)</code>. It replaces today's mix of <code>allowed</code>, <code>canWrite</code> and <code>isRootAdmin</code> checks spread across files. A test suite walks the full matrix below, one row per role and action, so a regression fails CI instead of shipping.</p>
+<p>There are five actions. <b>read</b> and <b>write</b> are ordinary notes. <b>publish</b> covers content that binds an agent: <code>skills/**</code>, <code>vault/skills.md</code>, <code>vault/rules/**</code>. <b>manage</b> covers members, shares and keys. <b>admin</b> covers users and the whole system.</p>
+<table>
+  <tr><th>Who</th><th>read</th><th>write</th><th>publish</th><th>manage</th><th>admin</th></tr>
+  <tr><td>Space owner</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="n">no</td></tr>
+  <tr><td>Space admin</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="p">members and shares, not the owner</td><td class="n">no</td></tr>
+  <tr><td>Space editor</td><td class="y">yes</td><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+  <tr><td>Space viewer</td><td class="y">yes</td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+  <tr><td>Project share, editor</td><td class="p">that project</td><td class="p">that project, own session logs</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+  <tr><td>Project share, viewer</td><td class="p">that project</td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+  <tr><td>Super admin, with a super key</td><td class="p">anything, audited and visible to the owner</td><td class="p">anything, audited and visible</td><td class="y">@system</td><td class="y">any space</td><td class="y">yes</td></tr>
+  <tr><td>Super admin, with an everyday key</td><td colspan="5">Same as any user. Your daily Claude Code key gets no god-mode, so a prompt injection in a session can't use powers it doesn't hold.</td></tr>
+</table>
+<p>A key then narrows this. A key with cap <code>read</code> can't write even where its user can. A key limited to <code>@priya</code> can't touch spaces shared with Priya. A <code>super</code> key can only be minted by the super user, expires in at most 7 days, and every action it takes is an audit event marked <code>super.*</code>.</p>
+
+<!-- ============================================================ 6 -->
+<h2 id="flows">6. Flows</h2>
+
+<h3>Onboarding a friend, MCP only</h3>
+<ol>
+  <li>You call <code>admin_create_user</code> with handle <code>priya</code>. The server creates the user and a personal hosted space <code>@priya</code> seeded with templates and a <code>skills.md</code> whose default row points at <code>@system</code> skills, and returns a one-time invite link that expires in 72 hours.</li>
+  <li>Priya opens the link. It shows her first key exactly once, with cap <code>manage</code>, limited to her own spaces. In phase 4 she registers a passkey here instead and mints keys from that.</li>
+  <li>She adds the MCP server to Claude Code with that key, or adds the claude.ai connector and signs in on the consent page.</li>
+  <li><code>get_context</code> now returns her space. <code>create_project</code> makes a project, <code>save</code> writes to her space, <code>create_key</code> gives her a narrower key for her VPS. None of this touches your brain or needs you.</li>
+</ol>
+
+<h3>Sharing a project</h3>
+<p>You call <code>share</code> with project <code>@yash/brainmcp</code>, user <code>@priya</code>, role editor. Priya's next <code>get_context</code> lists it under <code>shared_with_me</code>. When she works on it, her session logs and decisions are written into your space under that project with <code>author: priya</code>, so both of you see one history. She can't edit your skills, rules or any other project. You can revoke it with <code>unshare</code> and her keys lose it on the next request.</p>
+
+<figure>
+<svg viewBox="0 0 960 470" role="img" aria-label="get_context on a shared project">
+  <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78716c"/></marker></defs>
+  <style>.a3{stroke:#78716c;stroke-width:1.6;fill:none;marker-end:url(#ah3)}</style>
+  <rect x="30" y="16" width="130" height="40" rx="8" class="box"/><text x="44" y="41">Priya's agent</text>
+  <rect x="230" y="16" width="130" height="40" rx="8" class="blue"/><text x="258" y="41">Worker</text>
+  <rect x="430" y="16" width="130" height="40" rx="8" class="amber"/><text x="446" y="41">Control D1</text>
+  <rect x="630" y="16" width="130" height="40" rx="8" class="green"/><text x="650" y="41">DO @yash</text>
+  <rect x="810" y="16" width="130" height="40" rx="8" class="violet"/><text x="826" y="41">DO @system</text>
+  <line x1="95" y1="56" x2="95" y2="455" class="lane"/>
+  <line x1="295" y1="56" x2="295" y2="455" class="lane"/>
+  <line x1="495" y1="56" x2="495" y2="455" class="lane"/>
+  <line x1="695" y1="56" x2="695" y2="455" class="lane"/>
+  <line x1="875" y1="56" x2="875" y2="455" class="lane"/>
+
+  <line x1="95" y1="90" x2="293" y2="90" class="a3"/><text x="104" y="82" class="small">get_context { project: "@yash/brainmcp" }</text>
+  <line x1="295" y1="130" x2="493" y2="130" class="a3"/><text x="304" y="122" class="small">key hash → key, user, status</text>
+  <line x1="493" y1="160" x2="297" y2="160" class="a3"/><text x="320" y="153" class="small">@priya active · key cap write</text>
+  <line x1="295" y1="200" x2="493" y2="200" class="a3"/><text x="304" y="192" class="small">authorize(read, @yash/brainmcp)</text>
+  <line x1="493" y1="230" x2="297" y2="230" class="a3"/><text x="318" y="223" class="small">share: editor, expires 12-31 ✓</text>
+  <line x1="295" y1="275" x2="693" y2="275" class="a3"/><text x="410" y="267" class="small">project note, rules, decisions, sessions for brainmcp</text>
+  <line x1="295" y1="315" x2="873" y2="315" class="a3"/><text x="560" y="307" class="small">must-load skill bodies, pinned by hash</text>
+  <line x1="295" y1="355" x2="493" y2="355" class="a3"/><text x="304" y="347" class="small">audit: share.read</text>
+  <line x1="293" y1="405" x2="97" y2="405" class="a3"/><text x="104" y="397" class="small">context with source + author on every item</text>
+  <text x="104" y="440" class="small">Nothing from other @yash projects is read. The DO call is made only after authorize returns allow.</text>
+</svg>
+<figcaption>Figure 3. Priya opens a session on a project you shared with her.</figcaption>
+</figure>
+
+<h3>You as super admin</h3>
+<p>Day to day you use an ordinary key on <code>@yash</code> and behave like any user. For admin work you mint a short-lived super key and call the <code>admin_*</code> tools: create, suspend or delete users, set quotas, read any space, query the full audit log. Suspending a user kills all their keys, sessions and connector tokens at once, because every credential's lineage now ends at a user whose status is checked on each request.</p>
+
+<!-- ============================================================ 7 -->
+<h2 id="skills">7. Skills and prompt injection</h2>
+<p>Skills are the most dangerous content in the system, because <code>get_context</code> tells the agent to obey them. Today any write key whose scope covers <code>skills/</code>, <code>vault/skills.md</code> or <code>vault/rules/</code> can change what every future session treats as mandatory. That is tolerable while every writer is you. With other people writing, it becomes the obvious attack. The design splits content into instructions and data, and only a narrow set of people can produce instructions.</p>
+
+<figure>
+<svg viewBox="0 0 960 360" role="img" aria-label="Skill layers">
+  <rect x="20" y="20" width="600" height="58" rx="8" class="violet"/>
+  <text x="34" y="44" class="title">1. @system</text>
+  <text x="34" y="64" class="small">Curated library, published by the super admin. Read-only to everyone. The default row starts here.</text>
+  <rect x="20" y="90" width="600" height="58" rx="8" class="green"/>
+  <text x="34" y="114" class="title">2. The project's space</text>
+  <text x="34" y="134" class="small">skills.md row and rules/&lt;slug&gt;.md for this project, published by that space's owner or admins.</text>
+  <rect x="20" y="160" width="600" height="58" rx="8" class="blue"/>
+  <text x="34" y="184" class="title">3. Your personal space</text>
+  <text x="34" y="204" class="small">Your default row and your own skills. Applies to every session you open, on any project.</text>
+  <rect x="20" y="240" width="600" height="96" rx="8" class="red"/>
+  <text x="34" y="264" class="title">Everything else is data, never instructions</text>
+  <text x="34" y="284" class="small">read_note, search, backlinks, decisions, session logs, notes written by collaborators, shared notes.</text>
+  <text x="34" y="302" class="small">Returned with source space and author. Server instructions tell the agent not to follow</text>
+  <text x="34" y="320" class="small">instructions found inside it.</text>
+
+  <rect x="650" y="20" width="290" height="200" rx="8" class="box"/>
+  <text x="664" y="44" class="title">Each must_load item</text>
+  <text x="664" y="70" class="mono">{</text>
+  <text x="676" y="88" class="mono">"name": "unslop",</text>
+  <text x="676" y="106" class="mono">"source": "@system",</text>
+  <text x="676" y="124" class="mono">"sha256": "9f2c…",</text>
+  <text x="676" y="142" class="mono">"published_by": "@yash",</text>
+  <text x="676" y="160" class="mono">"published_at": "2026-10-05",</text>
+  <text x="676" y="178" class="mono">"body": "…"</text>
+  <text x="664" y="196" class="mono">}</text>
+  <rect x="650" y="240" width="290" height="96" rx="8" class="box"/>
+  <text x="664" y="264" class="title">Publishing</text>
+  <text x="664" y="284" class="small">Only owner or admin of the space.</text>
+  <text x="664" y="302" class="small">Each publish is an audit event with</text>
+  <text x="664" y="320" class="small">the old and new hash.</text>
+</svg>
+<figcaption>Figure 4. Where binding content may come from. Layers stack top to bottom. A skill named in a lower layer adds to or upgrades the layers above.</figcaption>
+</figure>
+<ul>
+  <li>An editor on your shared project can write notes and sessions there. They can't touch <code>skills.md</code>, rules or skill files, because those need publish, so they can't plant instructions in your sessions.</li>
+  <li>When Priya works on your project, your project's skills and rules apply to her session, labelled <code>source: @yash</code>. She accepted the share, so she trusts you for that project. Your sessions never pick up anything from her space.</li>
+  <li>The hash on each must-load skill lets a client notice when binding content changed since the last session.</li>
+  <li>The skills installer and <code>get_skill</code> serve supporting files too, such as <code>references/*.md</code>, so a skill works for someone with MCP alone and no repo access.</li>
+</ul>
+
+<!-- ============================================================ 8 -->
+<h2 id="security">8. Security and encryption</h2>
+
+<figure>
+<svg viewBox="0 0 960 400" role="img" aria-label="Encryption layers and key hierarchy">
+  <defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78716c"/></marker></defs>
+  <style>.a4{stroke:#78716c;stroke-width:1.6;fill:none;marker-end:url(#ah4)}</style>
+
+  <rect x="20" y="20" width="920" height="70" rx="10" class="violet"/>
+  <text x="34" y="44" class="title">In transit</text>
+  <text x="34" y="66" class="small">Client ↔ edge: TLS 1.3, HSTS preload, HTTP refused, minimum TLS 1.2. Edge ↔ Worker ↔ DO: Cloudflare internal network.</text>
+  <text x="34" y="82" class="small">Worker ↔ GitHub: TLS. GitHub → webhook: HMAC-SHA256 signed. Cookies: Secure, HttpOnly, SameSite.</text>
+
+  <rect x="20" y="104" width="920" height="54" rx="10" class="box"/>
+  <text x="34" y="128" class="title">At rest, platform</text>
+  <text x="34" y="148" class="small">D1, Durable Object SQLite and R2 are encrypted at rest by Cloudflare with AES-256. GitHub encrypts repositories at rest.</text>
+
+  <text x="20" y="188" class="title">At rest, application</text>
+  <rect x="20" y="200" width="200" height="70" rx="8" class="amber"/>
+  <text x="32" y="224" class="title">KEK v1, v2…</text>
+  <text x="32" y="244" class="small">Worker secret, versioned.</text>
+  <text x="32" y="260" class="small">Never stored in D1.</text>
+
+  <rect x="300" y="200" width="200" height="70" rx="8" class="amber"/>
+  <text x="312" y="224" class="title">DEK per space</text>
+  <text x="312" y="244" class="small">AES-256-GCM, stored wrapped</text>
+  <text x="312" y="260" class="small">in spaces.dek_wrapped</text>
+  <line x1="220" y1="235" x2="298" y2="235" class="a4"/><text x="232" y="228" class="small">wraps</text>
+
+  <rect x="580" y="200" width="360" height="70" rx="8" class="green"/>
+  <text x="592" y="224" class="title">Encrypted with the space DEK</text>
+  <text x="592" y="244" class="small">R2 snapshots, exports, note_versions history.</text>
+  <text x="592" y="260" class="small">Delete the DEK and every backup is unreadable.</text>
+  <line x1="500" y1="235" x2="578" y2="235" class="a4"/><text x="512" y="228" class="small">encrypts</text>
+
+  <rect x="300" y="290" width="200" height="54" rx="8" class="amber"/>
+  <text x="312" y="314" class="title">Encrypted with the KEK</text>
+  <text x="312" y="332" class="small">emails, third-party tokens</text>
+  <path d="M120,270 L120,317 L298,317" class="a4"/>
+
+  <rect x="580" y="290" width="360" height="54" rx="8" class="box"/>
+  <text x="592" y="314" class="title">Hashed, never stored</text>
+  <text x="592" y="332" class="small">API keys, session and OAuth tokens, invite codes (SHA-256)</text>
+
+  <text x="20" y="380" class="small">Rotating the KEK re-wraps the small DEKs only, so no note data is rewritten. Losing the KEK makes snapshots unreadable, so it is backed up offline by you.</text>
+</svg>
+<figcaption>Figure 5. Encryption layers and key hierarchy.</figcaption>
+</figure>
+
+<div class="card">
+  <h3 style="margin-top:0">One honest limit</h3>
+  <p style="margin-bottom:0">The live search index inside each space's Durable Object holds plaintext, because full-text search has to read the words. It is protected by Cloudflare's at-rest encryption, by the space being its own database, and by authorize running before any query. Application-level encryption covers history, backups, exports and personal data, and gives a real delete. A fully end-to-end encrypted "sealed project", where only the user's agent holds the key and the server can't search it, is possible later as an opt-in. I don't recommend it as the default because it removes search and the super admin's ability to audit content, which you asked for.</p>
+</div>
+
+<h3>Threats and controls</h3>
+<table>
+  <tr><th style="width:240px">Threat</th><th>Control</th></tr>
+  <tr><td>A key leaks</td><td>Only hashes stored. Cap and limits bound the damage. Expiry by default. Revoke cascades to every session and connector token. Rate limits on auth failures. <code>last_used</code> and the audit log show where it was used.</td></tr>
+  <tr><td>A collaborator plants instructions</td><td>Publish permission for skills, <code>skills.md</code> and rules. Provenance on every must-load item. Data framing for everything else. Server-set <code>author:</code>.</td></tr>
+  <tr><td>A query bug crosses users</td><td>A database per space. Authorize before routing. Permission-matrix tests in CI.</td></tr>
+  <tr><td>Your daily key is hijacked by a prompt injection</td><td>Daily keys carry no super powers. Super keys are separate, short-lived, and later need a passkey.</td></tr>
+  <tr><td>The super admin snoops</td><td>Allowed, because you asked for it, but every <code>super.read</code> appears in that user's own audit log. Nobody, including you, can read silently.</td></tr>
+  <tr><td>Someone edits the audit log</td><td>Each event carries the hash of the previous one. The daily chain head goes to an R2 bucket with a retention lock, so rewriting history breaks the chain.</td></tr>
+  <tr><td>D1 or R2 contents leak</td><td>D1 holds hashes and encrypted personal data, never note content. R2 snapshots are encrypted per space.</td></tr>
+  <tr><td>The GitHub token leaks</td><td>It only reaches <code>@yash</code>. Phase 4 replaces the PAT with a GitHub App installed on that one repo with Contents read and write only.</td></tr>
+  <tr><td>One user exhausts the free tier</td><td>Per-user quotas on notes, storage and writes a day. Rate limits per key.</td></tr>
+  <tr><td>A user leaves</td><td><code>export_space</code> gives them their data. Deletion drops their Durable Object and destroys their DEK, which makes every snapshot unreadable.</td></tr>
+  <tr><td>Web UI cross-site attacks</td><td>Existing SameSite cookies plus an Origin check on every state-changing <code>/app/api</code> call.</td></tr>
+</table>
+
+<!-- ============================================================ 9 -->
+<h2 id="tools">9. New MCP tools</h2>
+<p>Everything a user needs is an MCP tool, so nobody needs the web UI or repo access. Existing tools keep their names and gain an optional <code>space</code> argument. Project names accept <code>@space/slug</code>. A bare slug resolves to your own space first, then to projects shared with you, and an ambiguous name returns the choices instead of guessing.</p>
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Every user</h3>
+    <ul>
+      <li><code>whoami</code>: user, spaces, roles, shares, the calling key's cap</li>
+      <li><code>create_project</code>, <code>list_projects</code></li>
+      <li><code>share</code>, <code>unshare</code>, <code>list_shares</code></li>
+      <li><code>create_key</code>, <code>list_keys</code>, <code>revoke_key</code>, own keys only, never wider than yourself</li>
+      <li><code>create_space</code>, <code>add_member</code>, <code>remove_member</code></li>
+      <li><code>publish_skill</code>, <code>set_skills</code>, needs publish</li>
+      <li><code>audit_log</code>: your own actions, actions on your spaces, and any super-admin access to your data</li>
+      <li><code>export_space</code>: a short-lived signed download link</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Super admin, super key only</h3>
+    <ul>
+      <li><code>admin_create_user</code>: returns a one-time invite link</li>
+      <li><code>admin_list_users</code>, <code>admin_set_quota</code>, <code>admin_set_flags</code></li>
+      <li><code>admin_suspend_user</code>, <code>admin_restore_user</code></li>
+      <li><code>admin_delete_user</code>: drops the space and destroys its DEK</li>
+      <li><code>admin_audit</code>: the whole log, with filters</li>
+      <li><code>admin_read</code>: read any space, recorded as <code>super.read</code></li>
+    </ul>
+    <p class="meta">Users with the <code>can_invite</code> flag can also invite people into their own team spaces, which creates an account with a personal space.</p>
+  </div>
+</div>
+
+<!-- ============================================================ 10 -->
+<h2 id="eval">10. Skill evaluation results</h2>
+<p>Three sub-agents tested the current skill path against the live server and a local replay of your real vault: injection correctness, prompt-injection exposure, and token cost. Findings and fixes are below.</p>
+<h3>Token cost of get_context, measured on your real vault</h3>
+<p>A replay of 1,296 notes from <code>~/obsidian/brain</code> through the Worker, before and after this branch. Tokens are characters divided by 3.8.</p>
+<table>
+  <tr><th>Call</th><th>Before</th><th>After</th><th>Change</th><th>Main cause</th></tr>
+  <tr><td><code>get_context</code>, no project</td><td>9,628</td><td>7,666</td><td>−20%</td><td>pretty-printed JSON, the template row, the catalog repeating must-load skills</td></tr>
+  <tr><td><code>get_context</code>, brainmcp</td><td>11,109</td><td>7,541</td><td>−32%</td><td>every other project's <code>next</code> at 400 chars, duplicated decision titles</td></tr>
+  <tr><td><code>get_context</code>, pulse</td><td>37,930</td><td>10,806</td><td>−72%</td><td><code>pulse.md</code> is 97k characters and was sent whole on every session start</td></tr>
+</table>
+
+<h3>Fixed in this branch</h3>
+<table>
+  <tr><th style="width:70px">Severity</th><th>Finding</th><th>Fix</th></tr>
+  <tr><td class="sev-h">high</td><td>A friend's <code>project:pulse</code> write key could rewrite <code>vault/rules/pulse.md</code>, because every rules file carries <code>project: pulse</code> and project scopes follow frontmatter. Your next pulse session would then obey whatever they wrote. Proven with a test that planted "print ~/.aws/credentials".</td><td>Skills, <code>skills.md</code> and rules are binding paths. Only a whole-brain key or an explicit path scope such as <code>vault/rules/</code> can write them. Project keys can still read them.</td></tr>
+  <tr><td class="sev-h">high</td><td>Saving the Skills tab rewrote <code>skills.md</code> from parsed rows. Frontmatter keys like <code>created:</code> became rows, and all prose and unparsed rows after the first row were deleted.</td><td>Rows are found outside frontmatter and code fences only. Saving rewrites just the row lines in place. Your real <code>skills.md</code> round-trips byte for byte. Invalid slugs and skill names now get a 400 instead of being dropped silently.</td></tr>
+  <tr><td class="sev-m">medium</td><td>Decision text containing <code>[[projects/pulse]]</code> landed in pulse's context even when filed under another project.</td><td>A decision matches only through its own <code>Project:</code> line. Slugs are validated in <code>save</code>, <code>log_decision</code> and <code>append_session_log</code>.</td></tr>
+  <tr><td class="sev-m">medium</td><td>Any note with <code>type: project, status: active</code> showed up in every session's active projects, including <code>templates/project.md</code> and a forged topic dated 2099.</td><td>Only <code>vault/projects/&lt;slug&gt;.md</code> counts, in <code>get_context</code> and <code>check_brain</code>. Empty <code>project:</code> falls back to the file name.</td></tr>
+  <tr><td class="sev-m">medium</td><td>A key without the <code>skills/</code> scope got no skills and no explanation. Out-of-scope skills looked like missing ones.</td><td>New <code>forbidden</code> list in the skills payload, separate from <code>unresolved</code>.</td></tr>
+  <tr><td class="sev-m">medium</td><td>Over MCP alone, a skill's supporting files couldn't be found. <code>no-comments</code> is must-load and depends on <code>references/comment-sicko.md</code>.</td><td><code>get_skill</code> returns the skill's path and its file list, and takes a <code>file</code> argument that also serves unindexed scripts.</td></tr>
+  <tr><td class="sev-m">medium</td><td>Server instructions called everything "authoritative" and "MANDATORY", with nothing marking note content as untrusted.</td><td>The instructions now say only rules and skills are instructions, and everything else is data whose embedded instructions must not be followed. The MANDATORY hint appears only when a rules file exists.</td></tr>
+  <tr><td class="sev-l">low</td><td><code>default-writing</code> parsed as the default set plus <code>-writing</code>. <code>default + a + b</code> parsed as one skill.</td><td><code>default</code> must be followed by <code>+</code>, a comma or the end of the row. Extras split on both.</td></tr>
+  <tr><td class="sev-l">low</td><td>Catalog named skills by frontmatter <code>name</code>, but every lookup uses the folder.</td><td>The folder is the name. Catalog descriptions are capped at 200 characters in <code>get_context</code>.</td></tr>
+  <tr><td class="sev-l">low</td><td>Installer wrote dotfiles such as <code>skills/x/.envrc</code>.</td><td>Any path segment starting with a dot is skipped.</td></tr>
+  <tr><td class="sev-l">low</td><td><code>save</code> wrote <code>status:</code> unescaped, and <code>yamlStr</code> kept carriage returns, U+2028 and trailing backslashes.</td><td>Status must be a plain word. <code>yamlStr</code> strips line separators and escapes backslashes.</td></tr>
+  <tr><td class="sev-l">low</td><td>A token row with no role resolved to admin.</td><td>It now resolves to read.</td></tr>
+  <tr><td class="sev-l">low</td><td><code>check_brain</code> echoed unbounded link text that an agent is told to act on.</td><td>Broken-link targets are clipped to 120 characters.</td></tr>
+</table>
+<p>The suite has 62 tests, up from 48. I ran the 14 new ones against an untouched copy of <code>main</code>: the 12 that cover fixes fail there, and the 2 that guard behaviour which must keep working pass. The token-role default and the link clip have no dedicated test.</p>
+
+<h3>Left for the multi-user build, because they need it</h3>
+<ul>
+  <li>Telemetry ingest records no principal. Any write key can append to anyone's session and fill the shared 20k-row buffer. The fix needs a <code>key_id</code> column, which is a schema migration CI can't run, so it goes into phase 1.</li>
+  <li>Editing a note's frontmatter to <code>project: alpha</code> still widens what <code>project:alpha</code> keys can write. Binding paths are now safe from this. The real fix is project membership in a table, which is phase 1.</li>
+  <li>One shared <code>decisions.md</code> and one global <code>default</code> row. Section 7's per-space layers replace both.</li>
+  <li>The nightly hygiene snapshot is unscoped and <code>/health</code> is public. It only shows counts, but it should be per user once there are several.</li>
+</ul>
+
+<h3>Things for you to change in the vault</h3>
+<ul>
+  <li><code>no-comments</code> is must-load in <code>skills.md</code> but its own frontmatter says <code>disable-model-invocation: true</code>. That tells every session to run a user-invoked procedure unprompted. I'd drop the <code>!</code> and invoke it as <code>/no-comments</code>, which also saves about 760 tokens a session.</li>
+  <li><code>vault/projects/pulse.md</code> is 97k characters, 72k of it in "Current state". It's clipped to 8k in <code>get_context</code> now, but trimming it helps every tool that reads it.</li>
+  <li>portfolio, freelance, harness-hackathon and angel-os have an empty <code>project:</code>, so <code>get_context</code> never finds their session logs.</li>
+</ul>
+
+<!-- ============================================================ 11 -->
+<h2 id="phases">11. Build phases</h2>
+<figure>
+<svg viewBox="0 0 960 230" role="img" aria-label="Phases">
+  <defs><marker id="ah5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#78716c"/></marker></defs>
+  <style>.a5{stroke:#78716c;stroke-width:1.6;fill:none;marker-end:url(#ah5)}</style>
+  <rect x="10" y="20" width="170" height="190" rx="10" class="green"/>
+  <text x="22" y="44" class="title">0 · Now</text>
+  <text x="22" y="70" class="small">Skill fixes from</text><text x="22" y="86" class="small">section 10.</text><text x="22" y="110" class="small">No behaviour change</text><text x="22" y="126" class="small">for you beyond those.</text>
+  <rect x="200" y="20" width="175" height="190" rx="10" class="amber"/>
+  <text x="212" y="44" class="title">1 · Control plane</text>
+  <text x="212" y="70" class="small">users, spaces, members,</text><text x="212" y="86" class="small">audit log. Keys get an</text><text x="212" y="102" class="small">owner. One authorize().</text><text x="212" y="126" class="small">Existing keys become</text><text x="212" y="142" class="small">@yash keys. Invisible</text><text x="212" y="158" class="small">to you.</text>
+  <rect x="395" y="20" width="175" height="190" rx="10" class="blue"/>
+  <text x="407" y="44" class="title">2 · Spaces</text>
+  <text x="407" y="70" class="small">Durable Object per</text><text x="407" y="86" class="small">space. @yash moves its</text><text x="407" y="102" class="small">index there. Hosted</text><text x="407" y="118" class="small">spaces, invites, self-</text><text x="407" y="134" class="small">service tools. One</text><text x="407" y="150" class="small">friend as a pilot.</text>
+  <rect x="590" y="20" width="175" height="190" rx="10" class="violet"/>
+  <text x="602" y="44" class="title">3 · Sharing</text>
+  <text x="602" y="70" class="small">shares, @space/slug</text><text x="602" y="86" class="small">names, cross-space</text><text x="602" y="102" class="small">search, @system skills,</text><text x="602" y="118" class="small">provenance in</text><text x="602" y="134" class="small">get_context.</text>
+  <rect x="785" y="20" width="165" height="190" rx="10" class="red"/>
+  <text x="797" y="44" class="title">4 · Hardening</text>
+  <text x="797" y="70" class="small">passkeys, super step-up,</text><text x="797" y="86" class="small">encrypted snapshots,</text><text x="797" y="102" class="small">crypto-shred delete,</text><text x="797" y="118" class="small">quotas, GitHub App,</text><text x="797" y="134" class="small">security audit run 2.</text>
+  <line x1="180" y1="115" x2="198" y2="115" class="a5"/>
+  <line x1="375" y1="115" x2="393" y2="115" class="a5"/>
+  <line x1="570" y1="115" x2="588" y2="115" class="a5"/>
+  <line x1="765" y1="115" x2="783" y2="115" class="a5"/>
+</svg>
+<figcaption>Figure 6. Each phase ships as its own PR through the existing CI deploy and leaves the system working.</figcaption>
+</figure>
+<table>
+  <tr><th style="width:120px">Phase</th><th>Ships</th><th style="width:300px">How we know it works</th></tr>
+  <tr><td>1</td><td>D1 migration adding the control-plane tables; your existing keys become keys owned by <code>@yash</code> with the same reach; <code>authorize()</code> replaces the scattered checks; audit events on every write and denial.</td><td>All 48 current tests still pass unchanged. New permission-matrix test. Your Claude Code and claude.ai connector keep working with no reconnect.</td></tr>
+  <tr><td>2</td><td><code>SpaceDO</code> class; <code>@yash</code> reindexed into it from the tarball; hosted backing with <code>note_versions</code>; invites; <code>whoami</code>, <code>create_project</code>, <code>create_key</code>, <code>list_keys</code>, <code>revoke_key</code>, <code>audit_log</code>; <code>admin_create_user</code>.</td><td>Same note count and search results for <code>@yash</code> before and after. A test friend onboards end to end through MCP alone, and a test proves their key can't read <code>@yash</code>.</td></tr>
+  <tr><td>3</td><td>Shares, team spaces, <code>@space/slug</code> resolution, cross-space search, layered skills with provenance, <code>@system</code> space.</td><td>Share, use, revoke, and confirm the next call is denied. An editor's attempt to write <code>skills.md</code> is refused and audited.</td></tr>
+  <tr><td>4</td><td>Passkeys for the web UI and OAuth consent; super keys need one; encrypted R2 snapshots; export and delete; quotas; rate limiting; GitHub App.</td><td>Security audit run 2 with the same skill as run 1, plus a restore drill from an encrypted snapshot.</td></tr>
+</table>
+<p>Existing friend keys are converted, not broken. For each one I create a user and a share that grants the same projects the old scopes covered, then retire the old key after they reconnect.</p>
+
+<!-- ============================================================ 12 -->
+<h2 id="questions">12. Decisions I need from you</h2>
+<div class="card q">
+  <ol>
+    <li><b>Where friends' data lives.</b> I recommend hosted spaces, so it never enters your GitHub repo. The alternative is folders inside <code>Yash121l/brain</code>, which is faster to build but syncs everyone's notes to your Mac and your Obsidian.</li>
+    <li><b>Super-admin reads.</b> I recommend that you can read anything, and that each read shows up in that user's audit log. The alternative is silent access, which I'd advise against once friends trust the system with their notes.</li>
+    <li><b>Who can invite.</b> I recommend that only you can create users at first, with a per-user <code>can_invite</code> flag you can switch on for people who run team spaces.</li>
+    <li><b>Web UI for friends.</b> I recommend MCP only through phase 3, keeping the web UI for you. The UI already speaks the same API, so opening it to others later is mostly permission work.</li>
+    <li><b>Free tier.</b> The design fits the Workers free plan for a handful of users. If more than about ten people write daily, the 100k rows written a day limit becomes the constraint, and the $5 Workers paid plan lifts it.</li>
+  </ol>
+</div>
+<p>Once you answer these, I start with phase 0, which is already done in this branch, and phase 1.</p>
+
+</main>
+</body>
+</html>

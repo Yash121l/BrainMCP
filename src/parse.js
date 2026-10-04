@@ -109,6 +109,8 @@ export function parseNote(path, text) {
   };
 }
 
+export const PROJECT_NOTE_PATH = /^vault\/projects\/([^/]+)\.md$/;
+
 /** Should this repo path be indexed? */
 export function isIndexable(path) {
   if (!path.endsWith('.md')) return false;

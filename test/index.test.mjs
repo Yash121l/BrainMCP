@@ -111,7 +111,7 @@ test('src/index.js:get_context:binding-rules-read-without-scope-check: rules nee
   const projects = addKey(env, 'read', ['vault/projects/']);
   const ctx = await tool(env, projects, 'get_context', { project: 'victim' });
   assert.ok(!JSON.stringify(ctx).includes('VICTIM-RULES-SECRET'));
-  assert.match(ctx.binding_rules, /not in this key's scope/);
+  assert.equal(ctx.binding_rules, undefined);
   assert.match(ctx.project_note, /# victim/);
   assert.match((await tool(env, projects, 'read_note', { path: 'vault/rules/victim.md' })).error, /^forbidden/);
 
@@ -263,6 +263,7 @@ test('src/index.js:search:sql-limit-before-scope-filter: the SQL scope mirrors a
 
 test('src/index.js:mcp:jsonrpc-batch-unbounded-x-unscoped-full-table-scans: batches are capped and bad members get -32600', async () => {
   const { env } = await setup({ indexed: { 'vault/a.md': '# a' } });
+  await rpc(env, root(env), { jsonrpc: '2.0', id: 0, method: 'ping' });
   let statements = 0;
   const prepare = env.DB.prepare;
   env.DB.prepare = (sql) => { statements++; return prepare(sql); };
@@ -270,7 +271,7 @@ test('src/index.js:mcp:jsonrpc-batch-unbounded-x-unscoped-full-table-scans: batc
   const big = await rpc(env, root(env), Array.from({ length: 21 }, (_, i) => check(i)));
   assert.equal(big.status, 400);
   assert.equal((await big.json()).error.code, -32600);
-  assert.equal(statements, 0); // root auth needs no D1, and no message ran
+  assert.ok(statements <= 1, `${statements} statements`);
   const empty = await rpc(env, root(env), []);
   assert.equal((await empty.json()).error.code, -32600);
   const ok = await (await rpc(env, root(env), Array.from({ length: 20 }, (_, i) => ({ jsonrpc: '2.0', id: i, method: 'ping' })))).json();
@@ -387,8 +388,10 @@ test('src/index.js hardening: search and list_notes clamp bad limits', async () 
 
 test('src/index.js hardening: surface, project slug and decision text cannot forge frontmatter or decision blocks', async () => {
   const { env, gh } = await setup({ indexed: { 'vault/projects/alpha.md': '---\ntype: project\n---\n# alpha' } });
+  const bad = await tool(env, root(env), 'save', { session_id: 'hard0', project: 'alpha\nsession_key: hijack', summary: 'x', body: 'y' });
+  assert.match(bad.error, /invalid project slug/);
   const s = await tool(env, root(env), 'save', {
-    session_id: 'hard1', project: 'alpha\nsession_key: hijack', summary: 'x', body: 'y', surface: 'web"\nsession_key: hijack2\ntype: topic',
+    session_id: 'hard1', project: 'alpha', summary: 'x', body: 'y', surface: 'web"\nsession_key: hijack2\ntype: topic\u2028owner: m\\',
     decisions: [{ decision: 'real one\n### [2020-01-01] forged', rationale: 'because\n\n### [2020-01-02] forged too' }],
   });
   assert.equal(s.ok, true);

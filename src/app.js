@@ -4,10 +4,19 @@
 // search, graph, backlinks and (admin only) key management. Notes are read-only
 // here — writes go through git/MCP.
 
-import { resolvePrincipal, allowed, isRootAdmin, canWrite, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken } from './auth.js';
+import { resolvePrincipal, allowed, isRootAdmin, canWritePath, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken, roleWithoutSuper } from './auth.js';
 import { getFile, putFile } from './github.js';
-import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig, visibleEntries } from './skills.js';
+import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig, validateSkillEntries, visibleEntries } from './skills.js';
 import { upsertLocal } from './indexer.js';
+import { PROJECT_NOTE_PATH } from './parse.js';
+import { spacePrincipal } from './tenancy.js';
+import { auditInBackground } from './audit.js';
+import { ensureSchema } from './schema.js';
+
+const superSpace = (env) => env.DB.prepare(
+  `SELECT s.*, u.handle AS owner_handle FROM spaces s JOIN users u ON u.id = s.owner_id
+    WHERE u.is_super = 1 AND s.kind = 'personal' AND s.backing = 'git' AND s.status = 'active' ORDER BY s.created LIMIT 1`
+).first();
 
 async function sessionPrincipal(req, env) {
   const m = (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/);
@@ -35,10 +44,10 @@ const BROKEN_LINKS_CAP = 50;
  * Vault hygiene snapshot, scoped to the principal's readable prefixes.
  * Pass { role: 'admin', prefixes: [] } for the unscoped/cron view.
  */
-export async function computeHygiene(env, p) {
+export async function computeHygiene(db, p) {
   // ---- sessions: unsaved (no summary, older than a day) + activity in the last 7 days
   const sessions = (
-    await env.DB.prepare(
+    await db.prepare(
       `SELECT path, project, json_extract(frontmatter, '$.summary') AS summary,
               COALESCE(json_extract(frontmatter, '$.date'), updated) AS date
          FROM notes WHERE type = 'session'`
@@ -61,8 +70,8 @@ export async function computeHygiene(env, p) {
 
   // ---- active projects that have gone quiet
   const projects = (
-    await env.DB.prepare("SELECT path, project, updated FROM notes WHERE type = 'project' AND status = 'active'").all()
-  ).results.filter((r) => allowed(p, r.path));
+    await db.prepare("SELECT path, project, updated FROM notes WHERE type = 'project' AND status = 'active'").all()
+  ).results.filter((r) => PROJECT_NOTE_PATH.test(r.path) && allowed(p, r.path));
   const stale_active_projects = projects
     .filter((r) => {
       const age = daysAgo(r.updated);
@@ -78,13 +87,13 @@ export async function computeHygiene(env, p) {
   // ---- decisions
   let decisions_total = 0;
   if (allowed(p, 'vault/logs/decisions.md')) {
-    const d = await env.DB.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first();
+    const d = await db.prepare('SELECT body FROM notes WHERE path = ?').bind('vault/logs/decisions.md').first();
     if (d?.body) decisions_total = (d.body.match(/### \[/g) || []).length;
   }
 
   // ---- broken wikilinks (resolved the same way the graph endpoint resolves them).
   // Only readable notes resolve a link, so an out-of-scope target reads as missing.
-  const allNotes = (await env.DB.prepare('SELECT path FROM notes').all()).results.filter((n) => allowed(p, n.path));
+  const allNotes = (await db.prepare('SELECT path FROM notes').all()).results.filter((n) => allowed(p, n.path));
   const byNoExt = new Map();
   const byBase = new Map();
   for (const n of allNotes) {
@@ -93,13 +102,13 @@ export async function computeHygiene(env, p) {
     const b = ne.split('/').pop();
     if (!byBase.has(b)) byBase.set(b, n.path);
   }
-  const links = (await env.DB.prepare('SELECT src, dst FROM links').all()).results.filter((l) => allowed(p, l.src));
+  const links = (await db.prepare('SELECT src, dst FROM links').all()).results.filter((l) => allowed(p, l.src));
   const broken = [];
   for (const l of links) {
     const dst = String(l.dst || '');
     if (!dst || dst.includes('#')) continue; // heading-only / in-note anchors aren't notes
     const target = byNoExt.get(dst) || byNoExt.get(`vault/${dst}`) || byBase.get(dst.split('/').pop());
-    if (!target) broken.push({ src: l.src, dst });
+    if (!target) broken.push({ src: l.src, dst: dst.length > 120 ? `${dst.slice(0, 120)}…` : dst });
   }
 
   return {
@@ -118,19 +127,28 @@ export async function computeHygiene(env, p) {
   };
 }
 
-export async function handleApp(req, env, url) {
+function rejectCrossOrigin(req, url) {
+  if (req.method === 'GET' || req.method === 'HEAD') return null;
+  const origin = req.headers.get('Origin');
+  return origin && origin !== url.origin ? Response.json({ error: 'cross-origin request refused' }, { status: 403 }) : null;
+}
+
+export async function handleApp(req, env, url, ctx) {
   if (!url.pathname.startsWith('/app')) return null;
+  await ensureSchema(env);
 
   if (url.pathname === '/app/login' && req.method === 'POST') {
     const form = await req.formData();
     const principal = await resolvePrincipal(env, form.get('access_key') || '');
     if (!principal) return new Response('invalid or revoked key', { status: 403 });
+    if (!principal.keyId) return new Response('this credential cannot open a web session', { status: 403 });
     const tok = randToken(32);
     // A session never outlives the key it was minted from.
     await env.DB.prepare(
       `INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', 'webapp',
          min(datetime('now', '+30 days'), coalesce(datetime(?), datetime('now', '+30 days'))), ?, ?, ?)`
-    ).bind(await sha256hex(tok), principal.expires || null, principal.role, JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+    ).bind(await sha256hex(tok), principal.expires || null, roleWithoutSuper(principal.role), JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+    auditInBackground({ env, ctx, p: principal }, 'session.login', { detail: 'web' });
     const keyLeft = principal.expires ? Math.floor((Date.parse(principal.expires.replace(' ', 'T') + 'Z') - Date.now()) / 1000) : NaN;
     const maxAge = Number.isFinite(keyLeft) ? Math.max(0, Math.min(2592000, keyLeft)) : 2592000;
     // Secure is mandatory everywhere except loopback, where `wrangler dev` serves
@@ -150,14 +168,22 @@ export async function handleApp(req, env, url) {
     return new Response(null, { status: 302, headers: { Location: '/' } });
   }
 
-  const p = await sessionPrincipal(req, env);
+  const principal = await sessionPrincipal(req, env);
 
   if (url.pathname.startsWith('/app/api/')) {
-    if (!p) return Response.json({ error: 'unauthorized' }, { status: 401 });
+    if (!principal) return Response.json({ error: 'unauthorized' }, { status: 401 });
+    const crossOrigin = rejectCrossOrigin(req, url);
+    if (crossOrigin) return crossOrigin;
+    const space = await superSpace(env);
+    const p = space ? await spacePrincipal(env, principal, space) : principal;
 
     if (url.pathname === '/app/api/me') {
-      return Response.json({ role: p.role, name: p.name, prefixes: p.scopes ?? p.prefixes });
+      return Response.json({
+        role: p ? p.role : 'none', name: principal.name, prefixes: p ? (p.scopes ?? p.prefixes) : [],
+        user: principal.user ? `@${principal.user.handle}` : null, space: space ? `@${space.handle}` : null,
+      });
     }
+    if (!p) return Response.json({ error: 'this key has no access to this brain' }, { status: 403 });
     if (url.pathname === '/app/api/notes') {
       const r = await env.DB.prepare('SELECT path, title, type FROM notes ORDER BY path').all();
       return Response.json({ notes: r.results.filter((n) => allowed(p, n.path)) });
@@ -212,25 +238,25 @@ export async function handleApp(req, env, url) {
       return Response.json({ nodes: notes.map((n) => ({ id: n.path, title: n.title, type: n.type || 'note' })), links: edges });
     }
     if (url.pathname === '/app/api/check') {
-      return Response.json(await computeHygiene(env, p));
+      return Response.json(await computeHygiene(env.DB, p));
     }
 
     // ---- always-on skills: which skills bind to which project (vault/skills.md)
     const SKILLS_PATH = 'vault/skills.md';
 
     if (url.pathname === '/app/api/skills' && req.method === 'GET') {
-      const [catalog, configText] = await Promise.all([skillCatalog(env, p), readSkillsConfig(env)]);
+      const [catalog, configText] = await Promise.all([skillCatalog(env.DB, (name) => allowed(p, `skills/${name}/SKILL.md`)), readSkillsConfig(env)]);
       const entries = visibleEntries(p, skillsConfigEntries(configText).entries);
       return Response.json({
         catalog,
         entries,
         inherits_default: entries.filter((e) => e.inherits_default).map((e) => e.project),
-        editable: canWrite(p) && allowed(p, SKILLS_PATH),
+        editable: canWritePath(p, SKILLS_PATH),
       });
     }
 
     if (url.pathname === '/app/api/skills' && req.method === 'PUT') {
-      if (!canWrite(p) || !allowed(p, SKILLS_PATH)) {
+      if (!canWritePath(p, SKILLS_PATH)) {
         return Response.json({ error: 'no write access to vault/skills.md' }, { status: 403 });
       }
       const body = await req.json().catch(() => ({}));
@@ -238,9 +264,10 @@ export async function handleApp(req, env, url) {
       if (!body.entries.some((e) => e?.project === 'default')) {
         return Response.json({ error: 'a "default" row is required — it is the fallback for every session' }, { status: 400 });
       }
+      const invalid = validateSkillEntries(body.entries);
+      if (invalid) return Response.json({ error: invalid }, { status: 400 });
       const existing = await getFile(env, SKILLS_PATH);
-      const { header } = skillsConfigEntries(existing?.content || '');
-      const content = renderSkillsConfig(header, body.entries);
+      const content = renderSkillsConfig(existing?.content || '', body.entries);
       const sha = await putFile(env, SKILLS_PATH, content, 'skills: update project mappings (web UI)', existing?.sha);
       await upsertLocal(env, SKILLS_PATH, content);
       return Response.json({ ok: true, commit: sha });
@@ -249,7 +276,7 @@ export async function handleApp(req, env, url) {
     // ---- the scope vocabulary the key editor offers: real projects and real folders,
     // so granting access is picking from the brain instead of typing paths.
     if (url.pathname === '/app/api/scopes' && req.method === 'GET') {
-      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
       const notes = (await env.DB.prepare('SELECT path, title, type, project, status FROM notes').all()).results;
 
       const perProject = new Map();
@@ -294,21 +321,23 @@ export async function handleApp(req, env, url) {
 
     // ---- key management (admin only)
     if (url.pathname === '/app/api/keys' && req.method === 'GET') {
-      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
       return Response.json({ keys: await listKeys(env) });
     }
     if (url.pathname === '/app/api/keys' && req.method === 'POST') {
-      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
+      if (body.role === 'super') return Response.json({ error: 'super keys are minted over MCP with a super key' }, { status: 400 });
       try {
-        const created = await createKey(env, body);
+        const created = await createKey(env, { name: body.name, role: body.role, prefixes: body.prefixes, expires_days: body.expires_days });
+        auditInBackground({ env, ctx, p: principal }, 'key.create', { target: created.id, detail: { role: body.role, via: 'web' } });
         return Response.json(created, { status: 201 });
       } catch (e) {
         return Response.json({ error: e.message }, { status: 400 });
       }
     }
     if (url.pathname === '/app/api/keys' && req.method === 'PATCH') {
-      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
       if (!body.id) return Response.json({ error: 'id required' }, { status: 400 });
       const { id, ...patch } = body;
@@ -319,10 +348,11 @@ export async function handleApp(req, env, url) {
       }
     }
     if (url.pathname === '/app/api/keys/revoke' && req.method === 'POST') {
-      if (!isRootAdmin(p)) return Response.json({ error: 'admin only' }, { status: 403 });
+      if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
       const body = await req.json().catch(() => ({}));
       if (!body.id) return Response.json({ error: 'id required' }, { status: 400 });
       await revokeKey(env, body.id);
+      auditInBackground({ env, ctx, p: principal }, 'key.revoke', { target: body.id, detail: 'web' });
       return Response.json({ ok: true });
     }
 

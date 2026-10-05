@@ -276,13 +276,18 @@ test('deleting a user wipes their space, destroys the key and leaves nothing beh
   }
 });
 
-test('the web UI only shows the super user brain to its members', async () => {
+test('the web UI opens your own space and keeps the super user brain to its members', async () => {
   const { env } = await setup();
   const alice = await onboard(env, await superKey(env), 'alice');
   const login = await http(env, 'POST', '/app/login', null, { body: new URLSearchParams({ access_key: alice }) });
   const cookie = login.headers.get('set-cookie').match(/brain_session=[^;]+/)[0];
-  assert.equal((await http(env, 'GET', '/app/api/notes', null, { headers: { Cookie: cookie } })).status, 403);
-  assert.equal((await (await http(env, 'GET', '/app/api/me', null, { headers: { Cookie: cookie } })).json()).user, '@alice');
+  const own = await (await http(env, 'GET', '/app/api/notes', null, { headers: { Cookie: cookie } })).json();
+  assert.ok(own.notes.some((n) => n.path === 'vault/README.md'));
+  assert.ok(!own.notes.some((n) => n.path === 'vault/projects/pulse.md'));
+  assert.equal((await http(env, 'GET', '/app/api/notes?space=@yash', null, { headers: { Cookie: cookie } })).status, 403);
+  assert.equal((await http(env, 'GET', '/app/api/note?space=@yash&path=vault/projects/pulse.md', null, { headers: { Cookie: cookie } })).status, 403);
+  const me = await (await http(env, 'GET', '/app/api/me', null, { headers: { Cookie: cookie } })).json();
+  assert.deepEqual([me.user, me.space, me.super, me.root_admin, me.spaces.map((s) => s.handle)], ['@alice', '@alice', false, false, ['@alice']]);
   const evil = await http(env, 'POST', '/app/api/keys', null, { headers: { Cookie: cookie, Origin: 'https://evil.test', 'content-type': 'application/json' }, body: '{}' });
   assert.equal(evil.status, 403);
 });
@@ -389,4 +394,84 @@ test('review fixes: tenants cannot starve the super user telemetry buffer; versi
   const ex = await tool(env, alice, 'export_space');
   await tool(env, sk, 'admin_set_user', { handle: 'alice', status: 'suspended' });
   assert.equal((await http(env, 'GET', new URL(ex.url).pathname)).status, 410);
+});
+
+async function webLogin(env, key) {
+  const res = await http(env, 'POST', '/app/login', null, { body: new URLSearchParams({ access_key: key }) });
+  const cookie = res.headers.get('set-cookie')?.match(/brain_session=[^;]+/)?.[0];
+  const get = async (path) => http(env, 'GET', path, null, { headers: { Cookie: cookie } });
+  const run = async (name, args = {}) => {
+    const r = await http(env, 'POST', '/app/api/tool', null, { headers: { Cookie: cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name, args }) });
+    return { status: r.status, body: await r.json() };
+  };
+  return { cookie, get, run };
+}
+
+test('web UI: only a super-key session is super; the tool route keeps every MCP check', async () => {
+  const { env } = await setup();
+  const sk = await superKey(env);
+  const alice = await onboard(env, sk, 'alice');
+  const yashAdmin = await tool(env, sk, 'create_key', { name: 'laptop', role: 'admin' });
+
+  const sup = await webLogin(env, sk);
+  const supMe = await (await sup.get('/app/api/me')).json();
+  assert.deepEqual([supMe.super, supMe.super_user, supMe.root_admin], [true, true, true]);
+  assert.ok(supMe.spaces.some((s) => s.handle === '@alice' && s.access === 'super'));
+  const users = await sup.run('admin_list_users');
+  assert.equal(users.status, 200);
+  assert.deepEqual(users.body.users.map((u) => u.user).sort(), ['@alice', '@yash']);
+  assert.ok((await sup.run('admin_list_spaces')).body.spaces.some((s) => s.space === '@alice' && s.owner === '@alice'));
+
+  const plain = await webLogin(env, yashAdmin.key);
+  const plainMe = await (await plain.get('/app/api/me')).json();
+  assert.deepEqual([plainMe.super, plainMe.super_user], [false, true]);
+  assert.equal((await plain.run('admin_list_users')).status, 403);
+  assert.ok(!plainMe.spaces.some((s) => s.handle === '@alice'));
+
+  const a = await webLogin(env, alice);
+  assert.equal((await a.run('admin_list_users')).status, 403);
+  assert.equal((await a.run('create_key', { name: 'x', role: 'super' })).status, 403);
+  assert.equal((await a.run('create_project', { slug: 'garden' })).status, 200);
+  assert.ok((await a.run('list_projects')).body.projects.some((p) => p.project === '@alice/garden'));
+  assert.deepEqual((await a.run('list_members', { space: '@alice' })).body.members.map((m) => [m.user, m.role]), [['@alice', 'owner']]);
+  assert.equal((await a.run('list_members', { space: '@yash' })).status, 403);
+
+  const evil = await http(env, 'POST', '/app/api/tool', null, { headers: { Cookie: a.cookie, Origin: 'https://evil.test', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'whoami' }) });
+  assert.equal(evil.status, 403);
+
+  await tool(env, sk, 'revoke_key', { id: env.DB.sqlite.prepare("SELECT id FROM api_keys WHERE role = 'super'").get().id });
+  assert.equal((await sup.get('/app/api/me')).status, 401);
+});
+
+test('web UI: the super admin can browse a user space, and the user sees every read in their audit log', async () => {
+  const { env } = await setup();
+  const sk = await superKey(env);
+  const alice = await onboard(env, sk, 'alice');
+  await tool(env, alice, 'create_project', { slug: 'garden', goal: 'grow tomatoes' });
+
+  const sup = await webLogin(env, sk);
+  const notes = await (await sup.get('/app/api/notes?space=@alice')).json();
+  assert.ok(notes.notes.some((n) => n.path === 'vault/projects/garden.md'));
+  const note = await (await sup.get('/app/api/note?space=@alice&path=vault/projects/garden.md')).json();
+  assert.match(note.content, /grow tomatoes/);
+  assert.equal((await (await sup.get('/app/api/search?space=@alice&q=tomatoes')).json()).results[0].path, 'vault/projects/garden.md');
+
+  const seen = (await tool(env, alice, 'audit_log')).events.filter((e) => e.action === 'super.web_read');
+  assert.deepEqual(seen.map((e) => e.target).sort(), ['notes', 'search: tomatoes', 'vault/projects/garden.md']);
+  assert.ok(seen.every((e) => e.actor === 'yash' && e.space === 'alice'));
+
+  const own = await (await sup.get('/app/api/notes')).json();
+  assert.ok(own.notes.some((n) => n.path === 'vault/projects/pulse.md'));
+  assert.equal((await tool(env, alice, 'audit_log')).events.filter((e) => e.action === 'super.web_read').length, 3);
+});
+
+test('web UI: sign-out kills the session server-side', async () => {
+  const { env } = await setup();
+  const alice = await onboard(env, await superKey(env), 'alice');
+  const a = await webLogin(env, alice);
+  assert.equal((await a.get('/app/api/me')).status, 200);
+  const out = await http(env, 'POST', '/app/logout', null, { headers: { Cookie: a.cookie } });
+  assert.equal(out.status, 204);
+  assert.match(out.headers.get('set-cookie'), /Max-Age=0/);
+  assert.equal((await a.get('/app/api/me')).status, 401);
 });

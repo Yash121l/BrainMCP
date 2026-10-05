@@ -1113,7 +1113,7 @@ export default {
     if (inviteRes) return inviteRes;
 
     // Browser UI: login + note browser + link graph
-    const appRes = await handleApp(req, env, url, ctx);
+    const appRes = await handleApp(req, env, url, ctx, callTool);
     if (appRes) return appRes;
 
     if (url.pathname === '/health') {

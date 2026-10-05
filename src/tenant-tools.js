@@ -28,6 +28,7 @@ const USER_TOOLS = [
   { name: 'list_keys', description: 'Your keys (never the secrets).', inputSchema: obj({ all: { type: 'boolean', description: 'super admin only: every user\'s keys' } }) },
   { name: 'revoke_key', description: 'Revoke one of your keys; its web sessions and connector tokens die with it.', inputSchema: obj({ id: str }, ['id']) },
   { name: 'audit_log', description: 'Audit events you may see: your own actions, actions on spaces you own or admin, and any access to your data, including by the super admin.', inputSchema: obj({ limit: { type: 'number' }, action: str, before: { type: 'number' } }) },
+  { name: 'list_members', description: 'Members of a space you belong to, with their roles and whether they accepted.', inputSchema: obj({ space: str }, ['space']) },
   { name: 'export_space', description: 'A one-time download link (valid 1 hour) for everything in a hosted space you own or admin.', inputSchema: obj({ space: str }) },
   { name: 'set_skills', description: 'Set one row of a space\'s vault/skills.md, e.g. project "pulse", skills "default + tdd, !arena". Needs owner or admin of the space.', inputSchema: obj({ space: str, project: str, skills: str }, ['project', 'skills']) },
   { name: 'publish_skill', description: 'Write skills/<name>/SKILL.md (and optional supporting files) into a space. Needs owner or admin of the space.', inputSchema: obj({ space: str, name: str, content: str, files: { type: 'array', items: obj({ path: str, content: str }, ['path', 'content']) } }, ['name', 'content']) },
@@ -40,6 +41,7 @@ const ADMIN_TOOLS = [
   { name: 'admin_list_users', description: 'Super admin: every user with status, spaces and key counts.', inputSchema: obj({}) },
   { name: 'admin_set_user', description: 'Super admin: suspend or restore a user, toggle can_invite, set the note quota, or issue a fresh invite.', inputSchema: obj({ handle: str, status: { type: 'string', enum: ['active', 'suspended'] }, can_invite: { type: 'boolean' }, quota_notes: { type: 'number' }, new_invite: { type: 'boolean' } }, ['handle']) },
   { name: 'admin_delete_user', description: 'Super admin: delete a user. Wipes their hosted spaces and destroys the data keys, so backups become unreadable. purge also removes the rows.', inputSchema: obj({ handle: str, confirm: { type: 'string', description: 'repeat the handle' }, purge: { type: 'boolean' } }, ['handle', 'confirm']) },
+  { name: 'admin_list_spaces', description: 'Super admin: every active space with its owner, kind, members and shares.', inputSchema: obj({}) },
   { name: 'admin_audit', description: 'Super admin: the whole audit log, with filters. verify recomputes the hash chain.', inputSchema: obj({ limit: { type: 'number' }, user: str, action: str, before: { type: 'number' }, verify: { type: 'boolean' } }) },
 ];
 
@@ -184,10 +186,10 @@ export async function tenantTool(R, name, args) {
     case 'list_shares': {
       const ids = await managedSpaceIds(env, p.user.id);
       const given = (await env.DB.prepare(
-        `SELECT s.handle AS space, sh.project, u.handle AS grantee, sh.role, sh.expires FROM shares sh
+        `SELECT s.handle AS space, sh.project, u.handle AS grantee, sh.role, sh.expires, sh.accepted FROM shares sh
            JOIN spaces s ON s.id = sh.space_id JOIN users u ON u.id = sh.grantee_id
           WHERE sh.space_id IN (SELECT value FROM json_each(?)) ORDER BY s.handle, sh.project`
-      ).bind(JSON.stringify(ids)).all()).results.map((r) => ({ project: `${at(r.space)}/${r.project}`, with: at(r.grantee), role: r.role, expires: r.expires || null }));
+      ).bind(JSON.stringify(ids)).all()).results.map((r) => ({ project: `${at(r.space)}/${r.project}`, with: at(r.grantee), role: r.role, expires: r.expires || null, status: r.accepted ? 'active' : 'pending' }));
       const access = await loadAccess(env, p);
       const received = [];
       for (const s of access.shares) received.push({ project: `${at((await spaceById(env, s.space_id))?.handle)}/${s.project}`, role: s.role, expires: s.expires || null });
@@ -311,6 +313,16 @@ export async function tenantTool(R, name, args) {
     case 'audit_log':
       return { events: await queryAudit(env, { userId: p.user.id, spaceIds: await managedSpaceIds(env, p.user.id), limit: args.limit, action: args.action, before: args.before }) };
 
+    case 'list_members': {
+      const space = await spaceByHandle(env, args.space);
+      const pv = space && (await spacePrincipal(env, p, space));
+      if (!pv || pv.via === 'share') return { error: `forbidden: you are not a member of ${args.space}` };
+      const rows = (await env.DB.prepare(
+        'SELECT u.handle, m.role, m.accepted, m.created FROM members m JOIN users u ON u.id = m.user_id WHERE m.space_id = ? ORDER BY m.created'
+      ).bind(space.id).all()).results;
+      return { space: at(space.handle), members: rows.map((r) => ({ user: at(r.handle), role: r.role, status: r.accepted ? 'active' : 'pending', since: r.created })) };
+    }
+
     case 'export_space': {
       const t = await spaceArg(R, args.space);
       if (t.error) return t;
@@ -373,6 +385,7 @@ export async function tenantTool(R, name, args) {
     case 'admin_list_users':
     case 'admin_set_user':
     case 'admin_delete_user':
+    case 'admin_list_spaces':
     case 'admin_audit':
       if (!p.super) return denied(R, name, 'super admin key required');
       return adminTool(R, name, args);
@@ -428,8 +441,18 @@ async function adminTool(R, name, args) {
       auditInBackground(R, 'user.delete', { subject_user: args.purge ? null : u.id, target: at(u.handle), detail: r });
       return { ok: true, user: at(u.handle), ...r };
     }
+    case 'admin_list_spaces': {
+      const rows = (await env.DB.prepare(
+        `SELECT s.handle, s.kind, s.backing, s.created, u.handle AS owner,
+                (SELECT COUNT(*) FROM members m WHERE m.space_id = s.id) AS members,
+                (SELECT COUNT(*) FROM shares sh WHERE sh.space_id = s.id) AS shares
+           FROM spaces s JOIN users u ON u.id = s.owner_id WHERE s.status = 'active' ORDER BY s.created`
+      ).all()).results;
+      return { spaces: rows.map((r) => ({ ...r, space: at(r.handle), owner: at(r.owner) })) };
+    }
     case 'admin_audit': {
       const user = args.user ? await userByHandle(env, args.user) : null;
+      if (args.user && !user) return { error: `no user ${args.user}` };
       const events = user
         ? await queryAudit(env, { userId: user.id, spaceIds: await managedSpaceIds(env, user.id), limit: args.limit, action: args.action, before: args.before })
         : await queryAudit(env, { limit: args.limit, action: args.action, before: args.before });

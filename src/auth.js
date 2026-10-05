@@ -116,10 +116,10 @@ async function withUser(env, p, userId, spaceLimit) {
     ? await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first().catch(() => null)
     : await superUser(env);
   if ((userId && !user) || (user && user.status !== 'active')) return null;
-  const isSuper = !!user?.is_super && (p.via === 'root' || (p.via === 'key' && p.role === 'super'));
+  const isSuper = !!user?.is_super && (p.via === 'root' || p.role === 'super');
   return {
     ...p,
-    role: p.via === 'key' && p.role === 'super' && !isSuper ? 'admin' : p.role,
+    role: p.role === 'super' && !isSuper ? 'admin' : p.role,
     user: user || null,
     legacy: !userId,
     spaceLimit: spaceLimit ? JSON.parse(spaceLimit) : null,
@@ -156,12 +156,13 @@ export async function resolvePrincipal(env, token) {
   // A session / connector token is only as alive as its parent: the current root
   // generation, or a managed key that still exists, is not revoked and has not expired.
   const tok = await env.DB.prepare(
-    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.expires AS key_expires, k.user_id, k.space_limit FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
+    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.role AS key_role, k.expires AS key_expires, k.user_id, k.space_limit FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
      WHERE t.token_hash = ? AND t.kind = 'access' AND t.exp > datetime('now') AND (t.key_id = ? OR (${LIVE_KEY}))`
   ).bind(hash, await rootKeyId(env)).first().catch(() => null);
   if (tok) {
     const scopes = JSON.parse(tok.prefixes || '[]');
-    return withUser(env, { role: roleWithoutSuper(tok.role || 'read'), scopes, prefixes: await expandScopes(env.DB, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null },
+    const superSession = tok.client_id === 'webapp' && tok.role === 'super' && tok.key_role === 'super';
+    return withUser(env, { role: superSession ? 'super' : roleWithoutSuper(tok.role || 'read'), scopes, prefixes: await expandScopes(env.DB, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null },
       tok.user_id || null, tok.space_limit || null);
   }
 

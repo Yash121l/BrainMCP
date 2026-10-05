@@ -9,9 +9,31 @@ export class Unauthorized extends Error {
   }
 }
 
-export type Role = 'read' | 'write' | 'admin'
+export type Role = 'read' | 'write' | 'admin' | 'super'
 
-export type Me = { role: Role; name: string; prefixes: string[] }
+export type SpaceAccess = 'owner' | 'admin' | 'editor' | 'viewer' | 'share' | 'super' | 'system'
+export type SpaceRef = {
+  handle: string
+  kind: 'personal' | 'team' | 'system'
+  backing: 'git' | 'hosted'
+  owner: string
+  access: SpaceAccess
+}
+export type Me = {
+  role: Role | 'none'
+  name: string
+  prefixes: string[]
+  user: string | null
+  super: boolean
+  super_user: boolean
+  can_invite: boolean
+  expires: string | null
+  root_admin: boolean
+  space: string | null
+  access: SpaceAccess | null
+  writable: boolean
+  spaces: SpaceRef[]
+}
 export type NoteMeta = { path: string; title: string | null; type: string | null }
 export type Note = { path: string; content: string; frontmatter: Record<string, unknown> }
 export type SearchHit = { path: string; snippet: string }
@@ -66,6 +88,15 @@ export type HealthReport = {
   broken_links_total: number
 }
 
+let currentSpace: string | null = null
+
+export function scopeReadsToSpace(handle: string | null) {
+  currentSpace = handle
+}
+
+const inSpace = (path: string) =>
+  currentSpace ? `${path}${path.includes('?') ? '&' : '?'}space=${encodeURIComponent(currentSpace)}` : path
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/app/api/${path}`, { credentials: 'same-origin', ...init })
   if (res.status === 401) throw new Unauthorized()
@@ -92,24 +123,34 @@ const json = (body: unknown, method = 'POST'): RequestInit => ({
 })
 
 export const api = {
-  me: () => req<Me>('me'),
-  notes: () => req<{ notes: NoteMeta[] }>('notes').then((d) => d.notes),
-  note: (path: string) => req<Note>(`note?path=${encodeURIComponent(path)}`),
+  me: () => req<Me>(inSpace('me')),
+  notes: () => req<{ notes: NoteMeta[] }>(inSpace('notes')).then((d) => d.notes),
+  note: (path: string) => req<Note>(inSpace(`note?path=${encodeURIComponent(path)}`)),
   backlinks: (path: string) =>
-    req<{ backlinks: string[] }>(`backlinks?path=${encodeURIComponent(path)}`).then((d) => d.backlinks),
+    req<{ backlinks: string[] }>(inSpace(`backlinks?path=${encodeURIComponent(path)}`)).then(
+      (d) => d.backlinks,
+    ),
   search: (q: string, signal?: AbortSignal) =>
-    req<{ results: SearchHit[] }>(`search?q=${encodeURIComponent(q)}`, { signal }).then((d) => d.results),
-  graph: () => req<GraphData>('graph'),
+    req<{ results: SearchHit[] }>(inSpace(`search?q=${encodeURIComponent(q)}`), { signal }).then(
+      (d) => d.results,
+    ),
+  graph: () => req<GraphData>(inSpace('graph')),
   keys: () => req<{ keys: ApiKey[] }>('keys').then((d) => d.keys),
-  check: () => req<HealthReport>('check'),
-  skills: () => req<SkillsConfig>('skills'),
+  check: () => req<HealthReport>(inSpace('check')),
+  skills: () => req<SkillsConfig>(inSpace('skills')),
   saveSkills: (entries: SkillEntryInput[]) =>
-    req<{ ok: true; commit: string }>('skills', json({ entries }, 'PUT')),
+    req<{ ok: true; commit: string }>(inSpace('skills'), json({ entries }, 'PUT')),
+  tool: <T,>(name: string, args: Record<string, unknown> = {}) =>
+    req<T>('tool', json({ name, args })),
   scopes: () => req<Scopes>('scopes'),
   createKey: (body: KeyInput) => req<{ id: string; key: string }>('keys', json(body)),
   updateKey: (id: string, patch: Partial<KeyInput>) =>
     req<{ key: ApiKey }>('keys', json({ id, ...patch }, 'PATCH')).then((d) => d.key),
   revokeKey: (id: string) => req<{ ok: true }>('keys/revoke', json({ id })),
+}
+
+export async function logout() {
+  await fetch('/app/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {})
 }
 
 /** Log in with an access key. Returns an error message, or null on success. */

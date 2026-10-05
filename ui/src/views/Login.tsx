@@ -52,7 +52,8 @@ export function Login() {
             </div>
             <CardTitle className="text-base">Sign in</CardTitle>
             <CardDescription>
-              Any active access key works — you see exactly what your key is scoped to.
+              Use the key from your invite, or any key you made since. You see your own space and
+              whatever has been shared with you.
             </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
@@ -91,7 +92,7 @@ export function Login() {
           </CardFooter>
         </Card>
         <p className="mt-4 text-center text-xs text-muted-foreground">
-          Keys are managed in the Keys tab by an admin.
+          Super admin: sign in with your super key to open the Admin console.
         </p>
       </form>
     </div>

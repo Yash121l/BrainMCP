@@ -6,10 +6,13 @@ import {
   KeyRoundIcon,
   NetworkIcon,
   SearchIcon,
+  ShieldIcon,
   SparklesIcon,
+  UserIcon,
+  UsersIcon,
 } from 'lucide-react'
 
-import type { Me, NoteMeta } from '@/lib/api'
+import type { Me, NoteMeta, SpaceRef } from '@/lib/api'
 import { typeColor } from '@/lib/notes'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -17,8 +20,59 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { RoleBadge } from '@/components/role-badge'
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 
-export type Tab = 'notes' | 'graph' | 'health' | 'skills' | 'keys'
+export type Tab = 'notes' | 'graph' | 'health' | 'skills' | 'sharing' | 'account' | 'keys' | 'admin'
+
+const SPACE_GROUPS: { label: string; match: (s: SpaceRef) => boolean }[] = [
+  { label: 'Your spaces', match: (s) => ['owner', 'admin', 'editor', 'viewer'].includes(s.access) },
+  { label: 'Shared with you', match: (s) => s.access === 'share' },
+  { label: 'Super admin view', match: (s) => s.access === 'super' || s.access === 'system' },
+]
+
+const ACCESS_LABEL: Partial<Record<SpaceRef['access'], string>> = {
+  share: 'shared',
+  super: 'admin view',
+  system: 'default skills',
+}
+
+function SpaceSwitcher({ me, onSpace }: { me: Me; onSpace: (handle: string) => void }) {
+  if (me.spaces.length < 2) return null
+  return (
+    <div className="px-2 pt-2">
+      <Select value={me.space ?? undefined} onValueChange={onSpace}>
+        <SelectTrigger size="sm" className="w-full" aria-label="Space">
+          <SelectValue placeholder="Pick a space" />
+        </SelectTrigger>
+        <SelectContent>
+          {SPACE_GROUPS.map((g) => {
+            const items = me.spaces.filter(g.match)
+            if (!items.length) return null
+            return (
+              <SelectGroup key={g.label}>
+                <SelectLabel>{g.label}</SelectLabel>
+                {items.map((s) => (
+                  <SelectItem key={s.handle} value={s.handle}>
+                    {s.handle}
+                    <span className="text-xs text-muted-foreground">{ACCESS_LABEL[s.access] ?? s.access}</span>
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            )
+          })}
+        </SelectContent>
+      </Select>
+    </div>
+  )
+}
 
 const STORAGE_KEY = 'brain.tree.expanded'
 const WIDTH_KEY = 'brain.sidebar.width'
@@ -255,6 +309,8 @@ export function Sidebar({
   current,
   onOpenNote,
   onSearch,
+  onSpace,
+  pending,
 }: {
   me: Me | null
   notes: NoteMeta[]
@@ -264,6 +320,8 @@ export function Sidebar({
   current: string | null
   onOpenNote: (path: string) => void
   onSearch: () => void
+  onSpace: (handle: string) => void
+  pending: number
 }) {
   const tree = useMemo(() => buildTree(notes), [notes])
   const [expanded, setExpanded] = useState<Set<string>>(loadExpanded)
@@ -335,14 +393,19 @@ export function Sidebar({
     [current],
   )
 
-  const navItems: { id: Tab; label: string; icon: typeof FileTextIcon }[] = [
+  const navItems: { id: Tab; label: string; icon: typeof FileTextIcon; badge?: number }[] = [
     { id: 'notes', label: 'Notes', icon: FileTextIcon },
     { id: 'graph', label: 'Graph', icon: NetworkIcon },
     { id: 'health', label: 'Health', icon: ActivityIcon },
     { id: 'skills', label: 'Skills', icon: SparklesIcon },
-    ...(me?.role === 'admin'
-      ? [{ id: 'keys' as const, label: 'Keys', icon: KeyRoundIcon }]
+    ...(me?.user
+      ? [
+          { id: 'sharing' as const, label: 'Sharing', icon: UsersIcon, badge: pending },
+          { id: 'account' as const, label: 'Account', icon: UserIcon },
+        ]
       : []),
+    ...(me?.root_admin ? [{ id: 'keys' as const, label: 'Scoped keys', icon: KeyRoundIcon }] : []),
+    ...(me?.super_user ? [{ id: 'admin' as const, label: 'Admin', icon: ShieldIcon }] : []),
   ]
 
   return (
@@ -390,8 +453,10 @@ export function Sidebar({
 
       <Separator />
 
+      {me && <SpaceSwitcher me={me} onSpace={onSpace} />}
+
       <nav className="grid gap-1 p-2">
-        {navItems.map(({ id, label, icon: Icon }) => (
+        {navItems.map(({ id, label, icon: Icon, badge }) => (
           <button
             key={id}
             onClick={() => onTab(id)}
@@ -404,6 +469,11 @@ export function Sidebar({
           >
             <Icon className="size-4" />
             {label}
+            {!!badge && (
+              <span className="ml-auto rounded-full bg-amber-500/20 px-1.5 text-[10px] font-medium text-amber-300 tabular-nums">
+                {badge}
+              </span>
+            )}
           </button>
         ))}
       </nav>
@@ -437,8 +507,12 @@ export function Sidebar({
       <Separator />
 
       <div className="flex items-center gap-2 px-3 py-2.5">
-        <span className="min-w-0 truncate text-xs text-muted-foreground">{me?.name ?? '—'}</span>
-        {me && <RoleBadge role={me.role} className="ml-auto shrink-0 text-[10px]" />}
+        <span className="min-w-0 truncate text-xs text-muted-foreground" title={me?.name}>
+          {me?.user ?? me?.name ?? '—'}
+        </span>
+        {me && me.role !== 'none' && (
+          <RoleBadge role={me.super ? 'super' : me.role} className="ml-auto shrink-0 text-[10px]" />
+        )}
       </div>
     </aside>
   )

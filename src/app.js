@@ -1,15 +1,12 @@
 // JSON API + session login behind the browser UI. The UI itself is a React SPA
 // (see ui/) served from Workers static assets at /, so everything here is data:
-// POST /app/login mints the brain_session cookie, /app/api/* serves notes,
-// search, graph, backlinks and (admin only) key management. Notes are read-only
-// here — writes go through git/MCP.
+// POST /app/login mints the brain_session cookie.
 
-import { resolvePrincipal, allowed, isRootAdmin, canWritePath, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken, roleWithoutSuper } from './auth.js';
-import { getFile, putFile } from './github.js';
-import { skillCatalog, readSkillsConfig, skillsConfigEntries, renderSkillsConfig, validateSkillEntries, visibleEntries } from './skills.js';
-import { upsertLocal } from './indexer.js';
+import { resolvePrincipal, allowed, isRootAdmin, canWrite, canWritePath, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken, roleWithoutSuper } from './auth.js';
+import { skillCatalog, skillsConfigEntries, renderSkillsConfig, validateSkillEntries, visibleEntries } from './skills.js';
 import { PROJECT_NOTE_PATH } from './parse.js';
-import { spacePrincipal } from './tenancy.js';
+import { spacePrincipal, spaceByHandle, accessibleSpaces, allSpaces, defaultSpace } from './tenancy.js';
+import { spaceStore } from './store.js';
 import { auditInBackground } from './audit.js';
 import { ensureSchema } from './schema.js';
 
@@ -18,10 +15,11 @@ const superSpace = (env) => env.DB.prepare(
     WHERE u.is_super = 1 AND s.kind = 'personal' AND s.backing = 'git' AND s.status = 'active' ORDER BY s.created LIMIT 1`
 ).first();
 
+const sessionCookie = (req) => (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/)?.[1] || null;
+
 async function sessionPrincipal(req, env) {
-  const m = (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/);
-  if (!m) return null;
-  return resolvePrincipal(env, m[1]);
+  const tok = sessionCookie(req);
+  return tok ? resolvePrincipal(env, tok) : null;
 }
 
 // ---------------------------------------------------------------- hygiene report
@@ -133,7 +131,19 @@ function rejectCrossOrigin(req, url) {
   return origin && origin !== url.origin ? Response.json({ error: 'cross-origin request refused' }, { status: 403 }) : null;
 }
 
-export async function handleApp(req, env, url, ctx) {
+const accessOf = (pv) => (pv.via === 'member' ? pv.memberRole : pv.via);
+
+async function spaceList(env, principal) {
+  const spaces = principal.super ? await allSpaces(env) : await accessibleSpaces(env, principal);
+  const out = [];
+  for (const s of spaces) {
+    const pv = await spacePrincipal(env, principal, s);
+    if (pv) out.push({ handle: `@${s.handle}`, kind: s.kind, backing: s.backing, owner: `@${s.owner_handle}`, access: accessOf(pv) });
+  }
+  return out;
+}
+
+export async function handleApp(req, env, url, ctx, callTool = null) {
   if (!url.pathname.startsWith('/app')) return null;
   await ensureSchema(env);
 
@@ -147,8 +157,8 @@ export async function handleApp(req, env, url, ctx) {
     await env.DB.prepare(
       `INSERT INTO oauth_tokens (token_hash, kind, client_id, exp, role, prefixes, key_id) VALUES (?, 'access', 'webapp',
          min(datetime('now', '+30 days'), coalesce(datetime(?), datetime('now', '+30 days'))), ?, ?, ?)`
-    ).bind(await sha256hex(tok), principal.expires || null, roleWithoutSuper(principal.role), JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
-    auditInBackground({ env, ctx, p: principal }, 'session.login', { detail: 'web' });
+    ).bind(await sha256hex(tok), principal.expires || null, principal.super ? 'super' : roleWithoutSuper(principal.role), JSON.stringify(principal.scopes ?? []), principal.keyId || null).run();
+    auditInBackground({ env, ctx, p: principal }, 'session.login', { detail: principal.super ? 'web, super' : 'web' });
     const keyLeft = principal.expires ? Math.floor((Date.parse(principal.expires.replace(' ', 'T') + 'Z') - Date.now()) / 1000) : NaN;
     const maxAge = Number.isFinite(keyLeft) ? Math.max(0, Math.min(2592000, keyLeft)) : 2592000;
     // Secure is mandatory everywhere except loopback, where `wrangler dev` serves
@@ -163,6 +173,14 @@ export async function handleApp(req, env, url, ctx) {
     });
   }
 
+  if (url.pathname === '/app/logout' && req.method === 'POST') {
+    const crossOrigin = rejectCrossOrigin(req, url);
+    if (crossOrigin) return crossOrigin;
+    const tok = sessionCookie(req);
+    if (tok) await env.DB.prepare("DELETE FROM oauth_tokens WHERE token_hash = ? AND client_id = 'webapp'").bind(await sha256hex(tok)).run();
+    return new Response(null, { status: 204, headers: { 'Set-Cookie': 'brain_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0' } });
+  }
+
   // The UI moved to the SPA at the root; keep the old entrypoint as a redirect.
   if (url.pathname === '/app' || url.pathname === '/app/') {
     return new Response(null, { status: 302, headers: { Location: '/' } });
@@ -174,25 +192,64 @@ export async function handleApp(req, env, url, ctx) {
     if (!principal) return Response.json({ error: 'unauthorized' }, { status: 401 });
     const crossOrigin = rejectCrossOrigin(req, url);
     if (crossOrigin) return crossOrigin;
-    const space = await superSpace(env);
-    const p = space ? await spacePrincipal(env, principal, space) : principal;
+    const R = { env, ctx, p: principal, url };
+
+    if (url.pathname === '/app/api/tool' && req.method === 'POST' && callTool) {
+      if (env.MCP_LIMITER && !(await env.MCP_LIMITER.limit({ key: principal.keyId || 'root' })).success) {
+        return Response.json({ error: 'rate limited: too many calls from this key' }, { status: 429, headers: { 'Retry-After': '60' } });
+      }
+      const body = await req.json().catch(() => ({}));
+      try {
+        const result = await callTool(R, String(body.name || ''), body.args && typeof body.args === 'object' ? body.args : {});
+        const error = result?.error ? String(result.error) : null;
+        return Response.json(result, { status: !error ? 200 : error.startsWith('forbidden') ? 403 : 400 });
+      } catch (e) {
+        return Response.json({ error: e.message }, { status: 400 });
+      }
+    }
+
+    const wanted = url.searchParams.get('space');
+    const space = wanted ? await spaceByHandle(env, wanted) : (await defaultSpace(env, principal)) || (await superSpace(env));
+    if (wanted && !space) return Response.json({ error: `no space ${wanted}` }, { status: 404 });
+    const p = space ? await spacePrincipal(env, principal, space) : null;
+    const S = p ? spaceStore(env, space, principal.user?.handle || null) : null;
+    const db = S?.db;
+    const crossed = (target) => {
+      if ((p.via === 'share' || p.via === 'super') && space.owner_id !== principal.user?.id) {
+        auditInBackground(R, `${p.via}.web_read`, { space_id: space.id, subject_user: space.owner_id, target });
+      }
+    };
 
     if (url.pathname === '/app/api/me') {
+      const home = await superSpace(env);
+      const homePv = home ? await spacePrincipal(env, principal, home) : null;
+      const key = principal.keyId ? await env.DB.prepare('SELECT name FROM api_keys WHERE id = ?').bind(principal.keyId).first() : null;
       return Response.json({
-        role: p ? p.role : 'none', name: principal.name, prefixes: p ? (p.scopes ?? p.prefixes) : [],
-        user: principal.user ? `@${principal.user.handle}` : null, space: space ? `@${space.handle}` : null,
+        role: p ? p.role : 'none', name: key?.name || principal.name, prefixes: p ? (p.scopes ?? p.prefixes) : [],
+        user: principal.user ? `@${principal.user.handle}` : null,
+        super: !!principal.super,
+        super_user: !!principal.user?.is_super,
+        can_invite: !!principal.user?.can_invite,
+        expires: principal.expires || null,
+        root_admin: !!homePv && isRootAdmin(homePv) && isRootAdmin(principal),
+        space: space ? `@${space.handle}` : null,
+        access: p ? accessOf(p) : null,
+        writable: !!p && canWrite(p),
+        spaces: await spaceList(env, principal),
       });
     }
-    if (!p) return Response.json({ error: 'this key has no access to this brain' }, { status: 403 });
+    if (!p) return Response.json({ error: 'this key has no access to this space' }, { status: 403 });
     if (url.pathname === '/app/api/notes') {
-      const r = await env.DB.prepare('SELECT path, title, type FROM notes ORDER BY path').all();
+      const r = await db.prepare('SELECT path, title, type FROM notes ORDER BY path').all();
+      crossed('notes');
       return Response.json({ notes: r.results.filter((n) => allowed(p, n.path)) });
     }
     if (url.pathname === '/app/api/note') {
       const path = url.searchParams.get('path') || '';
       if (!allowed(p, path)) return Response.json({ error: 'forbidden' }, { status: 403 });
-      const r = await env.DB.prepare('SELECT path, body, frontmatter FROM notes WHERE path = ?').bind(path).first();
+      const r = await db.prepare('SELECT path, body, frontmatter FROM notes WHERE path = ?').bind(path).first();
       if (!r) return Response.json({ error: 'not found' }, { status: 404 });
+      crossed(path);
       return Response.json({ path: r.path, content: r.body, frontmatter: JSON.parse(r.frontmatter || '{}') });
     }
     if (url.pathname === '/app/api/backlinks') {
@@ -201,7 +258,7 @@ export async function handleApp(req, env, url, ctx) {
       const noExt = path.replace(/\.md$/, '');
       const noVault = noExt.replace(/^vault\//, '');
       const base = noExt.split('/').pop();
-      const r = await env.DB.prepare('SELECT DISTINCT src FROM links WHERE dst IN (?, ?, ?)').bind(noExt, noVault, base).all();
+      const r = await db.prepare('SELECT DISTINCT src FROM links WHERE dst IN (?, ?, ?)').bind(noExt, noVault, base).all();
       return Response.json({ backlinks: r.results.map((x) => x.src).filter((s) => allowed(p, s)) });
     }
     if (url.pathname === '/app/api/search') {
@@ -215,13 +272,14 @@ export async function handleApp(req, env, url, ctx) {
         sql += " AND EXISTS (SELECT 1 FROM json_each(?) j WHERE f.path = j.value OR substr(f.path, 1, length(rtrim(j.value, '/')) + 1) = rtrim(j.value, '/') || '/')";
         binds.push(JSON.stringify(p.prefixes));
       }
-      const r = await env.DB.prepare(sql + ' ORDER BY rank LIMIT 60').bind(...binds).all().catch(() => ({ results: [] }));
+      const r = await db.prepare(sql + ' ORDER BY rank LIMIT 60').bind(...binds).all().catch(() => ({ results: [] }));
+      crossed(`search: ${url.searchParams.get('q')}`);
       return Response.json({ results: r.results.filter((x) => allowed(p, x.path)).slice(0, 20) });
     }
     if (url.pathname === '/app/api/graph') {
-      const notes = (await env.DB.prepare('SELECT path, title, type FROM notes').all()).results.filter((n) => allowed(p, n.path));
+      const notes = (await db.prepare('SELECT path, title, type FROM notes').all()).results.filter((n) => allowed(p, n.path));
       const visible = new Set(notes.map((n) => n.path));
-      const links = (await env.DB.prepare('SELECT src, dst FROM links').all()).results;
+      const links = (await db.prepare('SELECT src, dst FROM links').all()).results;
       const byNoExt = new Map(); const byBase = new Map();
       for (const n of notes) {
         const ne = n.path.replace(/\.md$/, '');
@@ -235,17 +293,19 @@ export async function handleApp(req, env, url, ctx) {
         const t = byNoExt.get(l.dst) || byNoExt.get(`vault/${l.dst}`) || byBase.get(l.dst.split('/').pop());
         if (t && t !== l.src && visible.has(t)) edges.push({ source: l.src, target: t });
       }
+      crossed('graph');
       return Response.json({ nodes: notes.map((n) => ({ id: n.path, title: n.title, type: n.type || 'note' })), links: edges });
     }
     if (url.pathname === '/app/api/check') {
-      return Response.json(await computeHygiene(env.DB, p));
+      crossed('check');
+      return Response.json(await computeHygiene(db, p));
     }
 
     // ---- always-on skills: which skills bind to which project (vault/skills.md)
     const SKILLS_PATH = 'vault/skills.md';
 
     if (url.pathname === '/app/api/skills' && req.method === 'GET') {
-      const [catalog, configText] = await Promise.all([skillCatalog(env.DB, (name) => allowed(p, `skills/${name}/SKILL.md`)), readSkillsConfig(env)]);
+      const [catalog, configText] = await Promise.all([skillCatalog(db, (name) => allowed(p, `skills/${name}/SKILL.md`)), S.readConfig()]);
       const entries = visibleEntries(p, skillsConfigEntries(configText).entries);
       return Response.json({
         catalog,
@@ -257,7 +317,7 @@ export async function handleApp(req, env, url, ctx) {
 
     if (url.pathname === '/app/api/skills' && req.method === 'PUT') {
       if (!canWritePath(p, SKILLS_PATH)) {
-        return Response.json({ error: 'no write access to vault/skills.md' }, { status: 403 });
+        return Response.json({ error: `no write access to vault/skills.md in @${space.handle}` }, { status: 403 });
       }
       const body = await req.json().catch(() => ({}));
       if (!Array.isArray(body.entries)) return Response.json({ error: 'entries[] required' }, { status: 400 });
@@ -266,10 +326,10 @@ export async function handleApp(req, env, url, ctx) {
       }
       const invalid = validateSkillEntries(body.entries);
       if (invalid) return Response.json({ error: invalid }, { status: 400 });
-      const existing = await getFile(env, SKILLS_PATH);
+      const existing = await S.getFile(SKILLS_PATH);
       const content = renderSkillsConfig(existing?.content || '', body.entries);
-      const sha = await putFile(env, SKILLS_PATH, content, 'skills: update project mappings (web UI)', existing?.sha);
-      await upsertLocal(env, SKILLS_PATH, content);
+      const sha = await S.commit([{ path: SKILLS_PATH, content }], 'skills: update project mappings (web UI)');
+      auditInBackground(R, 'skills.set', { space_id: space.id, target: 'all rows', detail: 'web' });
       return Response.json({ ok: true, commit: sha });
     }
 
@@ -277,7 +337,7 @@ export async function handleApp(req, env, url, ctx) {
     // so granting access is picking from the brain instead of typing paths.
     if (url.pathname === '/app/api/scopes' && req.method === 'GET') {
       if (!isRootAdmin(p) || !isRootAdmin(principal)) return Response.json({ error: 'admin only' }, { status: 403 });
-      const notes = (await env.DB.prepare('SELECT path, title, type, project, status FROM notes').all()).results;
+      const notes = (await db.prepare('SELECT path, title, type, project, status FROM notes').all()).results;
 
       const perProject = new Map();
       const perArea = new Map();

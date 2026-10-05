@@ -3,6 +3,7 @@ import { cn } from '@/lib/utils'
 import type { Role } from '@/lib/api'
 
 const ROLE_CLASS: Record<Role, string> = {
+  super: 'border-violet-500/30 bg-violet-500/15 text-violet-300',
   admin: 'border-rose-500/25 bg-rose-500/10 text-rose-300',
   write: 'border-amber-500/25 bg-amber-500/10 text-amber-300',
   read: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300',

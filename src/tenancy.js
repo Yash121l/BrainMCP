@@ -26,6 +26,8 @@ export const spaceById = (env, id) =>
 export const userByHandle = (env, handle) =>
   env.DB.prepare("SELECT * FROM users WHERE handle = ? AND status != 'deleted'").bind(cleanHandle(handle)).first();
 export const systemSpace = (env) => spaceByHandle(env, SYSTEM_HANDLE);
+export const allSpaces = async (env) =>
+  (await env.DB.prepare(`${SPACE_SELECT} WHERE s.status = 'active' ORDER BY s.created`).all()).results;
 
 export async function loadAccess(env, p) {
   if (p.access) return p.access;

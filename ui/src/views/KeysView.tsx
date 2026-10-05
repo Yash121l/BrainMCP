@@ -65,7 +65,7 @@ const EXPIRY_OPTIONS: { value: Expiry; label: string }[] = [
   { value: 'never', label: 'Never' },
 ]
 
-function CopyButton({
+export function CopyButton({
   value,
   label = 'Copy',
   variant = 'outline',
@@ -155,7 +155,7 @@ function ExpiryPicker({
 }
 
 /** Everything the person on the other end needs, in the three shapes they might need it. */
-function Handoff({ name, secret }: { name: string; secret: string }) {
+export function Handoff({ name, secret, editable = true }: { name: string; secret: string; editable?: boolean }) {
   const origin = window.location.origin
   const mcp = `claude mcp add --transport http brain ${origin}/mcp --header "Authorization: Bearer ${secret}"`
   const installer = `curl -fsSL -H "Authorization: Bearer ${secret}" ${origin}/skills/install.sh | sh`
@@ -203,8 +203,8 @@ function Handoff({ name, secret }: { name: string; secret: string }) {
 
       <p className="flex items-start gap-2 text-xs text-amber-300/90">
         <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-        Copy it now — the key is hashed on the server and never shown again. The scope and role
-        stay editable; the secret does not.
+        Copy it now — the key is hashed on the server and never shown again.
+        {editable ? ' The scope and role stay editable; the secret does not.' : ' To change it later, revoke it and make a new one.'}
       </p>
       <CopyButton value={invite} label="Copy the whole invite" variant="secondary" />
     </div>

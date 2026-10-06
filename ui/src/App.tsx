@@ -1,4 +1,5 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
+import { BrainMark } from '@/components/logo'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 
 import {
@@ -12,47 +13,134 @@ import {
 } from '@/lib/api'
 import type { WhoAmI } from '@/lib/people'
 import { buildIndex } from '@/lib/notes'
-import { Sidebar, type Tab } from '@/components/sidebar'
+import { isOwn } from '@/lib/gateway'
+import { useGuides, type Page as GuidePage } from '@/lib/guides'
+import { PulseProvider, usePulse } from '@/lib/pulse'
+import { Sidebar, TopBar, type Dest } from '@/components/shell'
 import { CommandPalette } from '@/components/command-palette'
+import { HelpSheet, WelcomeModal } from '@/components/guides'
 import { Toaster } from '@/components/ui/sonner'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Login } from '@/views/Login'
-import { NoteView } from '@/views/NoteView'
-import { HealthView } from '@/views/HealthView'
-import { KeysView } from '@/views/KeysView'
-import { SkillsView } from '@/views/SkillsView'
-import { SharingView } from '@/views/SharingView'
-import { AccountView } from '@/views/AccountView'
-import { AdminView } from '@/views/AdminView'
-
-// force-graph + d3 are heavy; only pull them in when the Graph tab is opened.
-const GraphView = lazy(() => import('@/views/GraphView').then((m) => ({ default: m.GraphView })))
+import { HomeView } from '@/views/HomeView'
+import { AppsView } from '@/views/apps/AppsView'
+import { AgentsView } from '@/views/AgentsView'
+import { ActivityView } from '@/views/ActivityView'
+import { ApprovalsView } from '@/views/ApprovalsView'
+import { DeviceView } from '@/views/DeviceView'
+import { BrainView, BRAIN_TABS, type BrainTab } from '@/views/BrainView'
+import { SettingsView, SETTINGS_TABS, type SettingsTab } from '@/views/SettingsView'
 
 type Auth = 'checking' | 'in' | 'out'
+type Route = { dest: Dest; sub: string; params: URLSearchParams }
+
+const DESTS: Dest[] = ['home', 'apps', 'agents', 'activity', 'brain', 'settings', 'approvals', 'device']
+// Old tab names still work as links (bookmarks, the CLI, OAuth and device redirects).
+const LEGACY: Record<string, [Dest, string]> = {
+  notes: ['brain', 'notes'],
+  graph: ['brain', 'graph'],
+  health: ['brain', 'health'],
+  skills: ['brain', 'skills'],
+  sharing: ['settings', 'sharing'],
+  account: ['settings', 'account'],
+  keys: ['settings', 'keys'],
+  admin: ['settings', 'admin'],
+  rules: ['settings', 'rules'],
+  notifications: ['settings', 'notifications'],
+  connections: ['apps', ''],
+  machines: ['agents', ''],
+}
+
+function readHash(): Route | null {
+  const raw = window.location.hash.replace(/^#\/?/, '')
+  if (!raw) return null
+  const [path, query = ''] = raw.split('?')
+  const [name, sub = ''] = path.split('/')
+  const params = new URLSearchParams(query)
+  if (LEGACY[name]) return { dest: LEGACY[name][0], sub: LEGACY[name][1] || sub, params }
+  if ((DESTS as string[]).includes(name)) return { dest: name as Dest, sub, params }
+  return null
+}
+
+const hashFor = (dest: Dest, sub = '', query = '') => `#${dest}${sub ? `/${sub}` : ''}${query ? `?${query}` : ''}`
+
+const initialRoute = readHash()
 
 export default function App() {
   const [auth, setAuth] = useState<Auth>('checking')
   const [me, setMe] = useState<Me | null>(null)
+  const signedOut = useCallback(() => {
+    setAuth('out')
+    setMe(null)
+  }, [])
+
+  return (
+    <PulseProvider enabled={auth === 'in' && !!me?.user} onUnauthorized={signedOut}>
+      <Shell auth={auth} setAuth={setAuth} me={me} setMe={setMe} signedOut={signedOut} />
+    </PulseProvider>
+  )
+}
+
+function Shell({
+  auth,
+  setAuth,
+  me,
+  setMe,
+  signedOut,
+}: {
+  auth: Auth
+  setAuth: (a: Auth) => void
+  me: Me | null
+  setMe: (m: Me | null) => void
+  signedOut: () => void
+}) {
+  const [route, setRoute] = useState<Route>(initialRoute ?? { dest: 'home', sub: '', params: new URLSearchParams() })
   const [notes, setNotes] = useState<NoteMeta[]>([])
   const [notesLoading, setNotesLoading] = useState(true)
-
-  const [tab, setTab] = useState<Tab>('notes')
   const [path, setPath] = useState<string | null>(null)
   const [note, setNote] = useState<Note | null>(null)
   const [noteLoading, setNoteLoading] = useState(false)
   const [backlinks, setBacklinks] = useState<string[] | null>(null)
-
   const [graph, setGraph] = useState<GraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
-
   const [paletteOpen, setPaletteOpen] = useState(false)
-  const [pending, setPending] = useState(0)
-
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [welcomeOpen, setWelcomeOpen] = useState(false)
+  const [pendingShares, setPendingShares] = useState(0)
+  const [connected, setConnected] = useState<string | null>(null)
+  const guides = useGuides()
+  const pulse = usePulse()
   const index = useMemo(() => buildIndex(notes), [notes])
 
-  const signedOut = useCallback(() => {
-    setAuth('out')
-    setMe(null)
+  const go = useCallback((dest: Dest, sub = '', query = '', replace = false) => {
+    const next = hashFor(dest, sub, query)
+    if (window.location.hash !== next) {
+      if (replace) window.history.replaceState(null, '', next)
+      else window.history.pushState(null, '', next)
+    }
+    setRoute({ dest, sub, params: new URLSearchParams(query) })
+  }, [])
+
+  // Back from OAuth: "#apps?connected=figma_main" (or the old "#connections?..."). Show it once.
+  useEffect(() => {
+    const done = route.dest === 'apps' ? route.params.get('connected') : null
+    if (done) {
+      setConnected(done)
+      go('apps', '', '', true)
+    }
+  }, [route, go])
+
+  useEffect(() => {
+    const onHash = () => {
+      const r = readHash()
+      if (r) setRoute(r)
+    }
+    window.addEventListener('hashchange', onHash)
+    window.addEventListener('popstate', onHash)
+    return () => {
+      window.removeEventListener('hashchange', onHash)
+      window.removeEventListener('popstate', onHash)
+    }
   }, [])
 
   const fail = useCallback(
@@ -63,38 +151,38 @@ export default function App() {
     [signedOut],
   )
 
-  const loadSpace = useCallback((alive: () => boolean) => {
-    setNotesLoading(true)
-    return api.me().then((m) => {
-      if (!alive()) return
-      setMe(m)
-      setAuth('in')
-      if (m.user) {
-        api
-          .tool<WhoAmI>('whoami')
-          .then((w) => alive() && setPending(w.pending?.length ?? 0))
-          .catch(() => {})
-      }
-      if (m.role === 'none') {
-        setNotes([])
-        setNotesLoading(false)
-        return
-      }
-      return api.notes().then((list) => {
+  const loadSpace = useCallback(
+    (alive: () => boolean) => {
+      setNotesLoading(true)
+      return api.me().then((m) => {
         if (!alive()) return
-        setNotes(list)
-        setNotesLoading(false)
-        const start =
-          list.find((n) => n.path === 'vault/BRAIN.md') ??
-          list.find((n) => n.path === 'vault/README.md') ??
-          list[0]
-        setPath(start ? start.path : null)
-        if (!start) setNote(null)
+        setMe(m)
+        setAuth('in')
+        if (m.user) {
+          api
+            .tool<WhoAmI>('whoami')
+            .then((w) => alive() && setPendingShares(w.pending?.length ?? 0))
+            .catch(() => {})
+        }
+        if (m.role === 'none') {
+          setNotes([])
+          setNotesLoading(false)
+          return
+        }
+        return api.notes().then((list) => {
+          if (!alive()) return
+          setNotes(list)
+          setNotesLoading(false)
+          const start =
+            list.find((n) => n.path === 'vault/BRAIN.md') ?? list.find((n) => n.path === 'vault/README.md') ?? list[0]
+          setPath(start ? start.path : null)
+          if (!start) setNote(null)
+        })
       })
-    })
-  }, [])
+    },
+    [setAuth, setMe],
+  )
 
-  // session + note list
   useEffect(() => {
     let alive = true
     loadSpace(() => alive).catch((e) => {
@@ -105,7 +193,18 @@ export default function App() {
     return () => {
       alive = false
     }
-  }, [loadSpace])
+  }, [loadSpace, setAuth])
+
+  // Without a user (a scoped key), the gateway pages don't apply: land in the Brain.
+  useEffect(() => {
+    if (auth !== 'in' || !me || me.user) return
+    if (['home', 'apps', 'agents', 'activity', 'approvals', 'device'].includes(route.dest)) go('brain', 'notes', '', true)
+  }, [auth, me, route.dest, go])
+
+  // First visit: the welcome tour.
+  useEffect(() => {
+    if (auth === 'in' && me?.user && !guides.welcomeSeen && route.dest !== 'device') setWelcomeOpen(true)
+  }, [auth, me?.user, guides.welcomeSeen, route.dest])
 
   const refreshNotes = useCallback(() => {
     api.notes().then(setNotes).catch(() => {})
@@ -115,13 +214,12 @@ export default function App() {
     (handle: string) => {
       scopeReadsToSpace(handle)
       setGraph(null)
-      setTab('notes')
+      go('brain', 'notes')
       loadSpace(() => true).catch((e) => fail(e, `could not open ${handle}`))
     },
-    [loadSpace, fail],
+    [loadSpace, fail, go],
   )
 
-  // current note + its backlinks
   useEffect(() => {
     if (!path || auth !== 'in') return
     let alive = true
@@ -148,18 +246,19 @@ export default function App() {
     }
   }, [path, auth, fail])
 
-  // graph data, loaded the first time the tab is opened
+  const brainTab: BrainTab = (BRAIN_TABS as string[]).includes(route.sub) ? (route.sub as BrainTab) : 'notes'
+  const settingsTab: SettingsTab = (SETTINGS_TABS as string[]).includes(route.sub) ? (route.sub as SettingsTab) : 'account'
+
   useEffect(() => {
-    if (tab !== 'graph' || graph || graphLoading || auth !== 'in') return
+    if (route.dest !== 'brain' || brainTab !== 'graph' || graph || graphLoading || auth !== 'in') return
     setGraphLoading(true)
     api
       .graph()
       .then(setGraph)
       .catch((e) => fail(e, 'could not load the graph'))
       .finally(() => setGraphLoading(false))
-  }, [tab, graph, graphLoading, auth, fail])
+  }, [route.dest, brainTab, graph, graphLoading, auth, fail])
 
-  // ⌘K / Ctrl-K
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() === 'k' && (e.metaKey || e.ctrlKey)) {
@@ -171,17 +270,58 @@ export default function App() {
     return () => document.removeEventListener('keydown', onKey)
   }, [])
 
-  const openNote = useCallback((p: string) => {
-    setTab('notes')
-    setPath(p)
-  }, [])
+  const openNote = useCallback(
+    (p: string) => {
+      go('brain', 'notes')
+      setPath(p)
+    },
+    [go],
+  )
+
+  const openApp = useCallback((id: string | null) => go('apps', '', id ? `app=${encodeURIComponent(id)}` : ''), [go])
+  const openDirectory = useCallback(
+    (open: boolean, q?: string) => go('apps', '', open ? `add=1${q ? `&q=${encodeURIComponent(q)}` : ''}` : ''),
+    [go],
+  )
+  const addDevice = useCallback((open: boolean) => go('agents', '', open ? 'add=1' : ''), [go])
+  const advancedRules = useCallback(() => go('settings', 'rules'), [go])
+  const notifications = useCallback(() => go('settings', 'notifications'), [go])
+  const clearConnected = useCallback(() => setConnected(null), [])
+
+  const own = (pulse.overview?.connections ?? []).filter(isOwn)
+  const appsBadge = own.filter((c) => c.status !== 'active' || (c.review ?? 0) > 0).length
+
+  const pages = useMemo(
+    () =>
+      [
+        ...(me?.user
+          ? [
+              { label: 'Home', run: () => go('home') },
+              { label: 'Apps', keywords: 'connections accounts', run: () => go('apps') },
+              { label: 'Add an app (directory)', keywords: 'connect catalog', run: () => openDirectory(true) },
+              { label: 'Agents and devices', keywords: 'machines keys', run: () => go('agents') },
+              { label: 'Add a device', keywords: 'brain login code', run: () => addDevice(true) },
+              { label: 'Activity', keywords: 'log history audit', run: () => go('activity') },
+              { label: 'Approvals', keywords: 'pending', run: () => go('approvals') },
+              { label: 'Notifications', keywords: 'ntfy phone push', run: () => go('settings', 'notifications') },
+              { label: 'Advanced rules', keywords: 'policy permit forbid', run: () => go('settings', 'rules') },
+              { label: 'Project sharing', keywords: 'share invite', run: () => go('settings', 'sharing') },
+            ]
+          : []),
+        { label: 'Brain notes', run: () => go('brain', 'notes') },
+        { label: 'Graph', run: () => go('brain', 'graph') },
+        { label: 'Skills', run: () => go('brain', 'skills') },
+        { label: 'Health', run: () => go('brain', 'health') },
+        { label: 'Account', keywords: 'sign out keys', run: () => go('settings', 'account') },
+        { label: 'Guides', keywords: 'help reset tour', run: () => go('settings', 'guides') },
+      ] as { label: string; keywords?: string; run: () => void }[],
+    [me?.user, go, openDirectory, addDevice],
+  )
 
   if (auth === 'checking') {
     return (
       <div className="grid min-h-svh place-items-center">
-        <span className="animate-pulse text-2xl" aria-hidden>
-          🧠
-        </span>
+        <BrainMark className="size-12 animate-pulse" />
       </div>
     )
   }
@@ -195,50 +335,96 @@ export default function App() {
     )
   }
 
+  const dest = route.dest
+  const guidePage: GuidePage = dest === 'device' ? 'agents' : (dest as GuidePage)
+
   return (
     <TooltipProvider delayDuration={200}>
       <div className="flex h-svh overflow-hidden bg-background">
         <Sidebar
           me={me}
-          notes={notes}
-          loading={notesLoading}
-          tab={tab}
-          onTab={setTab}
-          current={path}
-          onOpenNote={openNote}
-          onSearch={() => setPaletteOpen(true)}
+          dest={dest}
+          onGo={(d) => go(d, d === 'brain' ? brainTab : d === 'settings' ? settingsTab : '')}
           onSpace={openSpace}
-          pending={pending}
+          badges={{ home: pulse.approvals?.length ?? 0, apps: appsBadge, settings: pendingShares }}
         />
         <main key={me?.space ?? ''} className="flex min-w-0 flex-1 flex-col">
+          <TopBar me={me} onSearch={() => setPaletteOpen(true)} onHelp={() => setHelpOpen(true)} onApprovals={() => go('approvals')} />
           {me && <SpaceBanner me={me} />}
           <div className="min-h-0 flex-1">
-          {tab === 'notes' && (
-            <NoteView
-              note={note}
-              loading={noteLoading}
-              index={index}
-              backlinks={backlinks}
-              onOpenNote={openNote}
-            />
-          )}
-          {tab === 'graph' && (
-            <Suspense
-              fallback={
-                <div className="grid h-full place-items-center text-sm text-muted-foreground">
-                  loading graph…
-                </div>
-              }
-            >
-              <GraphView data={graph} loading={graphLoading} onOpenNote={openNote} />
-            </Suspense>
-          )}
-          {tab === 'health' && <HealthView onOpenNote={openNote} onUnauthorized={signedOut} />}
-          {tab === 'skills' && <SkillsView onUnauthorized={signedOut} />}
-          {tab === 'sharing' && <SharingView onOpenSpace={openSpace} onNotesChanged={refreshNotes} onUnauthorized={signedOut} />}
-          {tab === 'account' && me && <AccountView me={me} onUnauthorized={signedOut} />}
-          {tab === 'keys' && me?.root_admin && <KeysView onUnauthorized={signedOut} />}
-          {tab === 'admin' && me && <AdminView me={me} onOpenSpace={openSpace} onUnauthorized={signedOut} />}
+            {me?.user && (
+              <>
+                {dest === 'home' && (
+                  <HomeView
+                    onApps={() => go('apps')}
+                    onOpenApp={(id) => openApp(id)}
+                    onDirectory={() => openDirectory(true)}
+                    onAgents={() => go('agents')}
+                    onAddDevice={() => addDevice(true)}
+                    onActivity={() => go('activity')}
+                    onApprovals={() => go('approvals')}
+                    onNotifications={notifications}
+                    onUnauthorized={signedOut}
+                  />
+                )}
+                {dest === 'apps' && (
+                  <AppsView
+                    openId={route.params.get('app')}
+                    directory={route.params.get('add') === '1'}
+                    directoryQuery={route.params.get('q') ?? undefined}
+                    connected={connected}
+                    onOpen={(id) => {
+                      clearConnected()
+                      openApp(id)
+                    }}
+                    onDirectory={openDirectory}
+                    onAdvancedRules={advancedRules}
+                    onUnauthorized={signedOut}
+                  />
+                )}
+                {dest === 'agents' && (
+                  <AgentsView addOpen={route.params.get('add') === '1'} onAddOpen={addDevice} onUnauthorized={signedOut} />
+                )}
+                {dest === 'activity' && <ActivityView onApprovals={() => go('approvals')} onUnauthorized={signedOut} />}
+                {dest === 'approvals' && <ApprovalsView onNotifications={notifications} onUnauthorized={signedOut} />}
+                {dest === 'device' && (
+                  <DeviceView
+                    key={route.params.get('code') ?? ''}
+                    code={route.params.get('code') ?? ''}
+                    onDone={() => go('agents')}
+                  />
+                )}
+              </>
+            )}
+            {dest === 'brain' && (
+              <BrainView
+                tab={brainTab}
+                onTab={(t) => go('brain', t)}
+                notes={notes}
+                notesLoading={notesLoading}
+                path={path}
+                note={note}
+                noteLoading={noteLoading}
+                index={index}
+                backlinks={backlinks}
+                graph={graph}
+                graphLoading={graphLoading}
+                onOpenNote={openNote}
+                onUnauthorized={signedOut}
+              />
+            )}
+            {dest === 'settings' && me && (
+              <SettingsView
+                me={me}
+                tab={settingsTab}
+                onTab={(t) => go('settings', t)}
+                pendingShares={pendingShares}
+                onOpenSpace={openSpace}
+                onNotesChanged={refreshNotes}
+                onWelcome={() => setWelcomeOpen(true)}
+                onUnauthorized={signedOut}
+              />
+            )}
           </div>
         </main>
       </div>
@@ -249,6 +435,17 @@ export default function App() {
         index={index}
         onOpenNote={openNote}
         onUnauthorized={signedOut}
+        pages={pages}
+      />
+      <HelpSheet open={helpOpen} onOpenChange={setHelpOpen} page={guidePage} onWelcome={() => setWelcomeOpen(true)} />
+      <WelcomeModal
+        open={welcomeOpen}
+        onClose={() => {
+          setWelcomeOpen(false)
+          guides.seeWelcome()
+        }}
+        onConnect={() => openDirectory(true)}
+        onAddDevice={() => addDevice(true)}
       />
       <Toaster position="bottom-right" />
     </TooltipProvider>

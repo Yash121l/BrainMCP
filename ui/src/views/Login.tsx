@@ -1,3 +1,4 @@
+import { BrainMark } from '@/components/logo'
 import { useState } from 'react'
 import { Loader2Icon, KeyRoundIcon } from 'lucide-react'
 
@@ -48,7 +49,7 @@ export function Login() {
         <Card>
           <CardHeader>
             <div className="mb-1 flex items-center gap-2 text-lg font-semibold tracking-tight">
-              <span aria-hidden>🧠</span> brain
+              <BrainMark className="size-7" /> BrainMCP
             </div>
             <CardTitle className="text-base">Sign in</CardTitle>
             <CardDescription>

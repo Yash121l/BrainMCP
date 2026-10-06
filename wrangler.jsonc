@@ -3,6 +3,14 @@
   "name": "brain-mcp",
   "main": "src/index.js",
   "compatibility_date": "2026-08-01",
+  // run_code (code mode) needs the Workers Paid plan and this binding; the tool stays
+  // hidden without it. ctx.exports is on by default at this compatibility date.
+  // "worker_loaders": [{ "binding": "LOADER" }],
+  // Semantic memory (hybrid search) needs both of these. First:
+  //   npx wrangler vectorize create brain-notes --dimensions=1024 --metric=cosine
+  // "ai": { "binding": "AI" },
+  // "vectorize": [{ "binding": "VECTORS", "index_name": "brain-notes" }],
+  // and add "MEMORY_MIN_SCORE": "0.45" to vars: bge-m3 scores unrelated notes around 0.3-0.4.
   "observability": { "enabled": true },
   // React SPA (ui/) served as static assets from the root; the Worker keeps
   // first claim on the API/OAuth/MCP routes below.
@@ -24,7 +32,11 @@
       "/health",
       "/skills/*",
       "/invite/*",
-      "/export/*"
+      "/export/*",
+      "/connect/*",
+      "/device",
+      "/device/*",
+      "/bridge/*"
     ]
   },
   // brain.yashlunawat.com is attached as a Workers custom domain in the dashboard.
@@ -42,11 +54,16 @@
   "durable_objects": {
     "bindings": [
       { "name": "SPACES", "class_name": "SpaceDO" },
-      { "name": "AUDIT", "class_name": "AuditDO" }
+      { "name": "AUDIT", "class_name": "AuditDO" },
+      // one per upstream account: serializes token refresh, keeps the upstream session warm
+      { "name": "CONNECTIONS", "class_name": "ConnectionDO" },
+      // one per machine: the brain CLI's local-server bridge holds a WebSocket here
+      { "name": "BRIDGE", "class_name": "BridgeDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["SpaceDO", "AuditDO"] }
+    { "tag": "v1", "new_sqlite_classes": ["SpaceDO", "AuditDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["ConnectionDO", "BridgeDO"] }
   ],
   "ratelimits": [
     { "name": "MCP_LIMITER", "namespace_id": "4101", "simple": { "limit": 300, "period": 60 } },
@@ -70,5 +87,5 @@
   "triggers": {
     "crons": ["0 3 * * *"]
   }
-  // secrets (wrangler secret put): BRAIN_TOKEN, GITHUB_TOKEN, WEBHOOK_SECRET
+  // secrets (wrangler secret put): BRAIN_TOKEN, GITHUB_TOKEN, WEBHOOK_SECRET, BRAIN_KEK, VAULT_KEK
 }

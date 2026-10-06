@@ -8,6 +8,8 @@ import { auditInBackground, queryAudit, verifyChain } from './audit.js';
 import { encryptText, unwrapDataKey } from './crypto.js';
 import { canWritePath } from './auth.js';
 import { skillsConfigEntries, renderSkillsConfig, validateSkillEntries, parseSkillsConfig } from './skills.js';
+import { machineFor, cleanTags } from './gateway.js';
+import { cleanAgent } from './gateway-tools.js';
 
 const str = { type: 'string' };
 const obj = (properties, required = []) => ({ type: 'object', properties, ...(required.length ? { required } : {}) });
@@ -24,7 +26,7 @@ const USER_TOOLS = [
   { name: 'create_space', description: 'Create a team space you own (up to 5). Add people with add_member.', inputSchema: obj({ handle: str }, ['handle']) },
   { name: 'add_member', description: 'Invite a user into a space you own or admin (they must accept), or change a member\'s role.', inputSchema: obj({ space: str, user: str, role: { type: 'string', enum: MEMBER_ROLES } }, ['space', 'user', 'role']) },
   { name: 'remove_member', description: 'Remove a user from a space you own or admin.', inputSchema: obj({ space: str, user: str }, ['space', 'user']) },
-  { name: 'create_key', description: 'Mint a key for yourself, e.g. for another machine. It can never exceed this key; spaces limits it further. Shown once.', inputSchema: obj({ name: str, role: { type: 'string', enum: ['read', 'write', 'admin', 'super'] }, spaces: { type: 'array', items: str }, expires_days: { type: 'number' } }, ['name', 'role']) },
+  { name: 'create_key', description: 'Mint a key for yourself, e.g. for another machine or agent. It can never exceed this key; spaces limits it further. machine and agent name the device and agent that will hold it (gateway rules match on them); a child key inherits both from this key unless given. Shown once.', inputSchema: obj({ name: str, role: { type: 'string', enum: ['read', 'write', 'admin', 'super'] }, spaces: { type: 'array', items: str }, expires_days: { type: 'number' }, machine: { type: 'string', description: 'device name, e.g. "macbook-pro"' }, agent: { type: 'string', description: 'agent name, e.g. "codex"' }, agent_tags: { type: 'array', items: str } }, ['name', 'role']) },
   { name: 'list_keys', description: 'Your keys (never the secrets).', inputSchema: obj({ all: { type: 'boolean', description: 'super admin only: every user\'s keys' } }) },
   { name: 'revoke_key', description: 'Revoke one of your keys; its web sessions and connector tokens die with it.', inputSchema: obj({ id: str }, ['id']) },
   { name: 'audit_log', description: 'Audit events you may see: your own actions, actions on spaces you own or admin, and any access to your data, including by the super admin.', inputSchema: obj({ limit: { type: 'number' }, action: str, before: { type: 'number' } }) },
@@ -44,6 +46,14 @@ const ADMIN_TOOLS = [
   { name: 'admin_list_spaces', description: 'Super admin: every active space with its owner, kind, members and shares.', inputSchema: obj({}) },
   { name: 'admin_audit', description: 'Super admin: the whole audit log, with filters. verify recomputes the hash chain.', inputSchema: obj({ limit: { type: 'number' }, user: str, action: str, before: { type: 'number' }, verify: { type: 'boolean' } }) },
 ];
+
+const READS = new Set(['whoami', 'list_projects', 'list_shares', 'list_keys', 'audit_log', 'list_members', 'admin_list_users', 'admin_list_spaces', 'admin_audit']);
+const DESTRUCTIVE = new Set(['unshare', 'remove_member', 'revoke_key', 'decline', 'admin_delete_user']);
+for (const t of [...USER_TOOLS, INVITE_TOOL, ...ADMIN_TOOLS]) {
+  t.annotations = READS.has(t.name)
+    ? { readOnlyHint: true, openWorldHint: false }
+    : { readOnlyHint: false, destructiveHint: DESTRUCTIVE.has(t.name), openWorldHint: false };
+}
 
 export function tenantToolDefs(p) {
   if (!p?.user) return [];
@@ -284,8 +294,14 @@ export async function tenantTool(R, name, args) {
         limit = p.spaceLimit;
       }
       try {
-        const created = await createKey(env, { name: args.name, role, expires_at: ends ? sqlTime(ends) : null, user_id: p.user.id, space_limit: limit, parent_key_id: p.keyId || null });
-        auditInBackground(R, 'key.create', { target: created.id, detail: { role, spaces: limit, expires: ends ? sqlTime(ends) : null } });
+        const agent = args.agent ? cleanAgent(args.agent) : p.agent || null;
+        const agentTags = args.agent_tags ? cleanTags(args.agent_tags) : p.agentTags || [];
+        const machine = args.machine ? await machineFor(env, p.user.id, args.machine) : null;
+        const created = await createKey(env, {
+          name: args.name, role, expires_at: ends ? sqlTime(ends) : null, user_id: p.user.id, space_limit: limit, parent_key_id: p.keyId || null,
+          machine_id: machine?.id || p.machineId || null, agent, agent_tags: agentTags,
+        });
+        auditInBackground(R, 'key.create', { target: created.id, detail: { role, spaces: limit, expires: ends ? sqlTime(ends) : null, machine: machine?.name, agent } });
         return { ok: true, id: created.id, key: created.key, expires: ends ? sqlTime(ends) : null, note: 'shown once; store it now. Revoking the key that minted it revokes this one too.' };
       } catch (e) {
         return { error: e.message };

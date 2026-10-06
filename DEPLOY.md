@@ -25,6 +25,23 @@ npx wrangler r2 bucket create brain-logs
 Nothing precious lives there. Losing it costs you historical tool-call logs and
 nothing else; the brain itself is in git.
 
+## Gateway rollout (control schema 4)
+The Worker creates the new tables on its first request, and `wrangler deploy` adds the
+`ConnectionDO` and `BridgeDO` classes (migration `v2`). One secret is new:
+```bash
+openssl rand -base64 32 | tee ~/.config/brain-mcp/vault-kek-backup | npx wrangler secret put VAULT_KEK
+chmod 600 ~/.config/brain-mcp/vault-kek-backup
+```
+Without it, only connections with `auth: none` work; the console says so.
+
+Optional, off by default in `wrangler.jsonc`:
+- **Semantic memory.** `npx wrangler vectorize create brain-notes --dimensions=1024 --metric=cosine`,
+  uncomment the `ai` and `vectorize` bindings, deploy, then `POST /admin/embed` (the nightly cron keeps it current).
+- **Code mode** (`run_code`). Needs the Workers Paid plan. Uncomment `worker_loaders`
+  (ctx.exports is already on at this compatibility date; adding `enable_ctx_exports`
+  stops the Worker from starting). Each distinct snippet is a new Dynamic Worker
+  (1,000 a month included, then $0.002 each per day).
+
 ## Setting up a machine (Mac, VPS, anything with Claude Code)
 No checkout, no clone, no sync daemon. Two commands and a scoped key:
 ```bash

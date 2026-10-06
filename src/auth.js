@@ -109,6 +109,23 @@ export async function parentKey(env, keyId) {
 
 export const roleWithoutSuper = (role) => (role === 'super' ? 'admin' : role);
 
+const jsonList = (v) => {
+  try {
+    const a = JSON.parse(v || '[]');
+    return Array.isArray(a) ? a.map(String) : [];
+  } catch {
+    return [];
+  }
+};
+
+/** The machine / agent identity a key carries; empty for keys minted before machines existed. */
+function agentOf(row) {
+  return { machineId: row.machine_id || null, agent: row.agent || null, agentTags: jsonList(row.agent_tags), pinned: jsonList(row.pinned) };
+}
+
+/** A browser session on the web console, as opposed to an agent's key or connector token. */
+export const isHumanSession = (p) => !!p && p.via === 'oauth' && p.name === 'webapp';
+
 const superUser = (env) => env.DB.prepare('SELECT * FROM users WHERE is_super = 1 ORDER BY created LIMIT 1').first().catch(() => null);
 
 async function withUser(env, p, userId, spaceLimit) {
@@ -144,29 +161,49 @@ export async function resolvePrincipal(env, token) {
   const hash = await sha256hex(token);
 
   const key = await env.DB.prepare(
-    "SELECT id, name, role, prefixes, expires, user_id, space_limit FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
+    "SELECT * FROM api_keys WHERE key_hash = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
   ).bind(hash).first().catch(() => null);
   if (key) {
     await env.DB.prepare("UPDATE api_keys SET last_used = datetime('now') WHERE id = ?").bind(key.id).run().catch(() => {});
+    if (key.machine_id) await env.DB.prepare("UPDATE machines SET last_seen = datetime('now') WHERE id = ?").bind(key.machine_id).run().catch(() => {});
     const scopes = JSON.parse(key.prefixes || '[]');
-    return withUser(env, { role: key.role, scopes, prefixes: await expandScopes(env.DB, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null },
+    return withUser(env, { role: key.role, scopes, prefixes: await expandScopes(env.DB, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null, ...agentOf(key) },
       key.user_id, key.space_limit);
   }
 
   // A session / connector token is only as alive as its parent: the current root
   // generation, or a managed key that still exists, is not revoked and has not expired.
   const tok = await env.DB.prepare(
-    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.role AS key_role, k.expires AS key_expires, k.user_id, k.space_limit FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
+    `SELECT t.role, t.prefixes, t.client_id, t.key_id, k.role AS key_role, k.expires AS key_expires, k.user_id, k.space_limit,
+            k.machine_id, k.agent, k.agent_tags, k.pinned FROM oauth_tokens t LEFT JOIN api_keys k ON k.id = t.key_id
      WHERE t.token_hash = ? AND t.kind = 'access' AND t.exp > datetime('now') AND (t.key_id = ? OR (${LIVE_KEY}))`
   ).bind(hash, await rootKeyId(env)).first().catch(() => null);
   if (tok) {
     const scopes = JSON.parse(tok.prefixes || '[]');
     const superSession = tok.client_id === 'webapp' && tok.role === 'super' && tok.key_role === 'super';
-    return withUser(env, { role: superSession ? 'super' : roleWithoutSuper(tok.role || 'read'), scopes, prefixes: await expandScopes(env.DB, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null },
+    return withUser(env, { role: superSession ? 'super' : roleWithoutSuper(tok.role || 'read'), scopes, prefixes: await expandScopes(env.DB, scopes), via: 'oauth', name: tok.client_id, keyId: tok.key_id, expires: tok.key_expires || null, ...agentOf(tok) },
       tok.user_id || null, tok.space_limit || null);
   }
 
   return null;
+}
+
+/**
+ * Rebuild the principal behind a key id, for work that continues without the bearer
+ * token (code-mode tool calls). The key must still be live, exactly as at login.
+ */
+export async function principalForKey(env, keyId) {
+  if (!keyId) return null;
+  if (keyId === (await rootKeyId(env))) {
+    return withUser(env, { role: 'admin', scopes: [], prefixes: [], via: 'root', name: 'root', keyId, expires: null }, null, null);
+  }
+  const key = await env.DB.prepare(
+    "SELECT * FROM api_keys WHERE id = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))"
+  ).bind(keyId).first().catch(() => null);
+  if (!key) return null;
+  const scopes = JSON.parse(key.prefixes || '[]');
+  return withUser(env, { role: key.role, scopes, prefixes: await expandScopes(env.DB, scopes), via: 'key', name: key.name, keyId: key.id, expires: key.expires || null, ...agentOf(key) },
+    key.user_id, key.space_limit);
 }
 
 /**
@@ -203,7 +240,13 @@ const expiresSql = (days) =>
   days == null || days === '' ? 'NULL' : `datetime('now', '+${Math.max(1, Math.min(3650, Number(days) | 0))} days')`;
 
 /** Create a key. Returns { id, key } — the plaintext key is shown exactly once. */
-export async function createKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null }) {
+/**
+ * The INSERT for a new key, not yet run, plus the plaintext key (shown once). `guard`
+ * turns it into INSERT ... SELECT ... WHERE <guard>, so a batch can make the key exist
+ * only if another row in the same transaction says so.
+ */
+export async function prepareKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null,
+  machine_id = null, agent = null, agent_tags = [], pinned = [] }, guard = null) {
   if (!ROLES.includes(role)) throw new Error('role must be read|write|admin|super');
   if (role === 'super' && (expires_days == null || expires_days === '')) expires_days = 7;
   if (role === 'super' && Number(expires_days) > 7) throw new Error('super keys expire within 7 days');
@@ -211,11 +254,20 @@ export async function createKey(env, { name, role = 'read', prefixes = [], expir
   checkGrant(role, scopes);
   const id = 'k_' + randToken(6);
   const key = 'bk_' + randToken(24);
-  await env.DB.prepare(
-    `INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked, user_id, space_limit, parent_key_id)
-     VALUES (?, ?, ?, ?, ?, datetime('now'), ${expires_at ? 'datetime(?)' : expiresSql(expires_days)}, 0, ?, ?, ?)`
-  ).bind(...[id, await sha256hex(key), String(name || id).slice(0, 100), role, JSON.stringify(scopes), ...(expires_at ? [expires_at] : []),
-    user_id, space_limit ? JSON.stringify(space_limit) : null, parent_key_id]).run();
+  const values = `?, ?, ?, ?, ?, datetime('now'), ${expires_at ? 'datetime(?)' : expiresSql(expires_days)}, 0, ?, ?, ?, ?, ?, ?, ?`;
+  const binds = [id, await sha256hex(key), String(name || id).slice(0, 100), role, JSON.stringify(scopes), ...(expires_at ? [expires_at] : []),
+    user_id, space_limit ? JSON.stringify(space_limit) : null, parent_key_id, machine_id, agent, JSON.stringify(agent_tags || []), JSON.stringify(pinned || [])];
+  const cols = 'INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked, user_id, space_limit, parent_key_id, machine_id, agent, agent_tags, pinned)';
+  const stmt = guard
+    ? env.DB.prepare(`${cols} SELECT ${values} WHERE ${guard.sql}`).bind(...binds, ...guard.binds)
+    : env.DB.prepare(`${cols} VALUES (${values})`).bind(...binds);
+  return { id, key, stmt };
+}
+
+/** Create a key. Returns { id, key } — the plaintext key is shown exactly once. */
+export async function createKey(env, opts) {
+  const { id, key, stmt } = await prepareKey(env, opts);
+  await stmt.run();
   return { id, key };
 }
 
@@ -268,9 +320,9 @@ export async function updateKey(env, id, patch = {}) {
   return getKey(env, id);
 }
 
-const rowToKey = (k) => ({ ...k, prefixes: JSON.parse(k.prefixes || '[]') });
-const KEY_COLUMNS = 'k.id, k.name, k.role, k.prefixes, k.created, k.expires, k.revoked, k.last_used, k.user_id, u.handle AS owner';
-const KEY_FROM = 'api_keys k LEFT JOIN users u ON u.id = k.user_id';
+const rowToKey = (k) => ({ ...k, prefixes: JSON.parse(k.prefixes || '[]'), agent_tags: jsonList(k.agent_tags), pinned: jsonList(k.pinned) });
+const KEY_COLUMNS = 'k.id, k.name, k.role, k.prefixes, k.created, k.expires, k.revoked, k.last_used, k.user_id, u.handle AS owner, k.machine_id, m.name AS machine, k.agent, k.agent_tags, k.pinned';
+const KEY_FROM = 'api_keys k LEFT JOIN users u ON u.id = k.user_id LEFT JOIN machines m ON m.id = k.machine_id';
 
 export async function getKey(env, id) {
   const r = await env.DB.prepare(`SELECT ${KEY_COLUMNS} FROM ${KEY_FROM} WHERE k.id = ?`).bind(id).first();
@@ -290,6 +342,9 @@ export async function revokeKey(env, id, seen = new Set()) {
   await env.DB.prepare('UPDATE api_keys SET revoked = 1 WHERE id = ?').bind(id).run();
   const children = (await env.DB.prepare('SELECT id FROM api_keys WHERE parent_key_id = ? AND revoked = 0').bind(id).all().catch(() => ({ results: [] }))).results;
   for (const c of children) await revokeKey(env, c.id, seen);
+  // the key's calls waiting for approval die with it, as does its taint record
+  await env.DB.prepare("UPDATE approvals SET status = 'void', args_sealed = NULL WHERE key_id = ? AND status IN ('pending', 'approved')").bind(id).run().catch(() => {});
+  await env.DB.prepare('DELETE FROM taint WHERE key_id = ?').bind(id).run().catch(() => {});
   // also kill every web session / connector token / pending consent code minted from this key
   await env.DB.prepare('DELETE FROM oauth_tokens WHERE key_id = ?').bind(id).run().catch(() => {});
   await env.DB.prepare('DELETE FROM oauth_codes WHERE key_id = ?').bind(id).run().catch(() => {});

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { FileTextIcon, Loader2Icon, SearchIcon } from 'lucide-react'
+import { ArrowRightIcon, FileTextIcon, Loader2Icon, SearchIcon } from 'lucide-react'
 
 import { api, Unauthorized, type SearchHit } from '@/lib/api'
 import { titleOf, typeColor, type NoteIndex } from '@/lib/notes'
@@ -45,12 +45,15 @@ export function CommandPalette({
   index,
   onOpenNote,
   onUnauthorized,
+  pages = [],
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
   index: NoteIndex
   onOpenNote: (path: string) => void
   onUnauthorized: () => void
+  /** Pages the palette can jump to: label plus what to run. */
+  pages?: { label: string; keywords?: string; run: () => void }[]
 }) {
   const [q, setQ] = useState('')
   const [hits, setHits] = useState<SearchHit[]>([])
@@ -97,6 +100,11 @@ export function CommandPalette({
   }, [q, index])
 
   const hitPaths = new Set(titleMatches.map((n) => n.path))
+  const pageMatches = useMemo(() => {
+    const term = q.trim().toLowerCase()
+    if (!term) return pages.slice(0, 6)
+    return pages.filter((p) => `${p.label} ${p.keywords ?? ''}`.toLowerCase().includes(term)).slice(0, 6)
+  }, [q, pages])
 
   function pick(path: string) {
     onOpenChange(false)
@@ -109,18 +117,37 @@ export function CommandPalette({
       open={open}
       onOpenChange={onOpenChange}
       shouldFilter={false}
-      title="Search the brain"
-      description="Search notes by title, path or full text"
+      title="Search"
+      description="Jump to a page, or search notes by title, path or full text"
       className="max-w-2xl"
     >
       <CommandInput
-        placeholder="Search the brain…"
+        placeholder="Search pages and notes…"
         value={q}
         onValueChange={setQ}
       />
       <CommandList className="max-h-[60vh]">
-        {!searching && titleMatches.length === 0 && hits.length === 0 && (
-          <CommandEmpty>No notes found.</CommandEmpty>
+        {!searching && titleMatches.length === 0 && hits.length === 0 && pageMatches.length === 0 && (
+          <CommandEmpty>Nothing found.</CommandEmpty>
+        )}
+
+        {pageMatches.length > 0 && (
+          <CommandGroup heading="Go to">
+            {pageMatches.map((p) => (
+              <CommandItem
+                key={p.label}
+                value={`p:${p.label}`}
+                onSelect={() => {
+                  onOpenChange(false)
+                  setQ('')
+                  p.run()
+                }}
+              >
+                <ArrowRightIcon className="size-3.5 text-muted-foreground" />
+                {p.label}
+              </CommandItem>
+            ))}
+          </CommandGroup>
         )}
 
         {titleMatches.length > 0 && (

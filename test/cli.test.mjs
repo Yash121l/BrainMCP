@@ -884,3 +884,16 @@ test('misc helpers', () => {
   const r = runCli(['--version'], { home: TMP });
   assert.equal(r.stdout.trim(), cli.VERSION);
 });
+
+test('a partial apply --shell keeps the exports of harnesses configured earlier', async () => {
+  const h = freshHome();
+  for (const d of ['.codex', '.cursor']) fs.mkdirSync(path.join(h, d), { recursive: true });
+  fs.writeFileSync(path.join(h, '.zshrc'), '# mine\n');
+  const deps = () => ({ home: h, creds: { server: SERVER, key: 'bk_cli', keys: { cli: 'bk_cli', codex: 'bk_cx', cursor: 'bk_cur' } }, which: () => null, selfCommand: '/abs/brain', bundle: null, fx: quietFx() });
+  await cli.runApply({ only: 'codex,cursor', shell: true }, deps());
+  await cli.runApply({ only: 'codex', shell: true }, deps());
+  const rc = fs.readFileSync(path.join(h, '.zshrc'), 'utf8');
+  assert.match(rc, /BRAIN_KEY_CODEX/);
+  assert.match(rc, /BRAIN_KEY_CURSOR/, 'reapplying codex alone must not drop cursor');
+  assert.match(rc, /^# mine$/m);
+});

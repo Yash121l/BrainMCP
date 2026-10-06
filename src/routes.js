@@ -87,7 +87,7 @@ export async function handleGatewayRoutes(req, env, url, ctx) {
     const hash = await sha256hex(String(body.device_code || ''));
     const row = await env.DB.prepare('SELECT * FROM device_codes WHERE device_hash = ?').bind(hash).first();
     if (!row || Date.parse(`${row.exp.replace(' ', 'T')}Z`) < Date.now()) return Response.json({ error: 'expired_token' }, { status: 400 });
-    if (row.status === 'pending') return Response.json({ error: 'authorization_pending' }, { status: 400 });
+    if (row.status === 'pending' || row.status === 'approving') return Response.json({ error: 'authorization_pending' }, { status: 400 });
     if (row.status === 'collected') return Response.json({ error: 'expired_token' }, { status: 400 });
     if (row.status === 'denied') {
       await env.DB.prepare('DELETE FROM device_codes WHERE device_hash = ?').bind(hash).run();

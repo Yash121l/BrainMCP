@@ -1196,9 +1196,12 @@ export async function runApply(opts, deps = {}) {
     const rcs = ['.zshrc', '.bashrc'].map((f) => path.join(h, f));
     let targets = rcs.filter(exists);
     if (!targets.length) targets = [path.join(h, (process.env.SHELL || '').endsWith('bash') ? '.bashrc' : '.zshrc')];
-    for (const rc of targets) fx.write(rc, upsertBlock(readText(rc) ?? '', shellBlock(cmd, envAgents)));
+    // the block is shared: keep exports for harnesses configured by earlier runs, not only this one
+    const allAgents = [...new Set([...(manifest.shellAgents || []), ...envAgents])];
+    for (const rc of targets) fx.write(rc, upsertBlock(readText(rc) ?? '', shellBlock(cmd, allAgents)));
     manifest.shell = [...new Set([...(manifest.shell || []), ...targets])];
-    log(`shell: ${envAgents.map(envVarFor).join(', ')} exported from ${targets.map((t) => path.basename(t)).join(', ')} (open a new shell)`);
+    manifest.shellAgents = allAgents;
+    log(`shell: ${allAgents.map(envVarFor).join(', ')} exported from ${targets.map((t) => path.basename(t)).join(', ')} (open a new shell)`);
   } else if (opts.shell) {
     log('shell: no configured agent reads its key from the environment; nothing to export');
   } else if (envAgents.length) {

@@ -726,20 +726,24 @@ async function consoleTool(R, name, args) {
       const code = String(args.user_code || '').trim().toUpperCase();
       const row = await env.DB.prepare("SELECT * FROM device_codes WHERE user_code = ? AND status = 'pending' AND exp > datetime('now')").bind(code).first();
       if (!row) return { error: 'that code is unknown or expired; run brain login again' };
+      // Claim the request first, atomically: of two decisions at once, exactly one proceeds.
+      const claim = await env.DB.prepare("UPDATE device_codes SET status = ?, user_id = ? WHERE device_hash = ? AND status = 'pending' AND exp > datetime('now')")
+        .bind(name === 'gw_device_deny' ? 'denied' : 'approving', me, row.device_hash).run();
+      if ((claim.meta?.changes ?? 0) !== 1) return { error: 'this request was already decided a moment ago' };
       if (name === 'gw_device_deny') {
-        await env.DB.prepare("UPDATE device_codes SET status = 'denied', user_id = ? WHERE device_hash = ?").bind(me, row.device_hash).run();
         audit('gw.device.deny', { target: row.machine });
         return { ok: true };
       }
+      const release = () => env.DB.prepare("UPDATE device_codes SET status = 'pending' WHERE device_hash = ? AND status = 'approving'").bind(row.device_hash).run();
       const role = ['read', 'write', 'admin'].includes(args.role) ? args.role : 'write';
-      if (role === 'admin' && p.role !== 'admin' && p.role !== 'super') return { error: 'your session cannot grant admin' };
-      if (role === 'write' && !canWrite(p)) return { error: 'your session cannot grant write' };
+      if (role === 'admin' && p.role !== 'admin' && p.role !== 'super') return (await release(), { error: 'your session cannot grant admin' });
+      if (role === 'write' && !canWrite(p)) return (await release(), { error: 'your session cannot grant write' });
       let machine;
       try {
         machine = await machineFor(env, me, args.machine || row.machine, args.machine_tags);
         if (args.machine_tags !== undefined) await env.DB.prepare('UPDATE machines SET tags = ? WHERE id = ?').bind(JSON.stringify(cleanTags(args.machine_tags)), machine.id).run();
       } catch (e) {
-        return { error: e.message };
+        return (await release(), { error: e.message });
       }
       let agents;
       let tags;
@@ -748,26 +752,33 @@ async function consoleTool(R, name, args) {
         if (!agents.length) agents = ['cli'];
         tags = cleanTags(args.agent_tags);
       } catch (e) {
-        return { error: e.message };
+        return (await release(), { error: e.message });
       }
       // A key minted here never exceeds the session that approves it: same scopes, same
       // space limit, an admin role only for an unscoped admin session.
       const scoped = !!p.scopes?.length;
       const grantRole = role === 'admin' && scoped ? 'write' : role;
       const live = await env.DB.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))").bind(me).first();
-      if (!p.super && live.n + agents.length > LIVE_KEYS_MAX) return { error: `this needs ${agents.length} new keys and you have ${live.n} of ${LIVE_KEYS_MAX}; revoke some first` };
+      if (!p.super && live.n + agents.length > LIVE_KEYS_MAX) return (await release(), { error: `this needs ${agents.length} new keys and you have ${live.n} of ${LIVE_KEYS_MAX}; revoke some first` });
       const keys = {};
       const ids = [];
-      for (const agent of agents) {
-        const created = await createKey(env, {
-          name: `${agent} @ ${machine.name}`, role: grantRole, user_id: me, parent_key_id: p.keyId || null, machine_id: machine.id, agent, agent_tags: tags,
-          prefixes: p.scopes || [], space_limit: p.spaceLimit || null, expires_at: p.expires || null,
-        });
-        keys[agent] = created.key;
-        ids.push(created.id);
+      try {
+        for (const agent of agents) {
+          const created = await createKey(env, {
+            name: `${agent} @ ${machine.name}`, role: grantRole, user_id: me, parent_key_id: p.keyId || null, machine_id: machine.id, agent, agent_tags: tags,
+            prefixes: p.scopes || [], space_limit: p.spaceLimit || null, expires_at: p.expires || null,
+          });
+          keys[agent] = created.key;
+          ids.push(created.id);
+        }
+        const done = await env.DB.prepare("UPDATE device_codes SET status = 'approved', key_sealed = ? WHERE device_hash = ? AND status = 'approving'")
+          .bind(await encryptWithKek(env, JSON.stringify(keys)), row.device_hash).run();
+        if ((done.meta?.changes ?? 0) !== 1) throw new Error('the request changed while it was being approved');
+      } catch (e) {
+        for (const id of ids) await revokeKey(env, id);
+        await release();
+        return { error: `approval failed, nothing was granted: ${e.message}` };
       }
-      await env.DB.prepare("UPDATE device_codes SET status = 'approved', user_id = ?, key_sealed = ? WHERE device_hash = ?")
-        .bind(me, await encryptWithKek(env, JSON.stringify(keys)), row.device_hash).run();
       audit('gw.device.approve', { target: machine.name, detail: { keys: ids, agents, role: grantRole } });
       return { ok: true, machine: machine.name, agent: agents[0], agents, key_id: ids[0], key_ids: ids };
     }

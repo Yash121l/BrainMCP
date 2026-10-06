@@ -6,7 +6,7 @@
 import { randToken } from './auth.js';
 import { auditInBackground } from './audit.js';
 import { FEATURED, featuredById, searchRegistry } from './catalog.js';
-import { discoverOauth, mcpPost } from './upstream.js';
+import { discoverOauth, mcpPost, safeUpstreamUrl } from './upstream.js';
 import { connName, reachableConnections, getConnection, SERVICE, LABEL } from './gateway.js';
 
 export const APP_TOOLS = ['gw_catalog', 'gw_connect_app', 'gw_app_access', 'gw_set_app_access', 'gw_home'];
@@ -48,8 +48,9 @@ async function freeLabel(env, userId, service, wanted) {
   return randToken(4).toLowerCase().replace(/[^a-z0-9]/g, 'x');
 }
 
-/** For a server from the registry: does it want OAuth, a token, or nothing? */
+/** For a server from the registry: does it want OAuth, a token, or nothing? The URL policy runs first: no probe ever reaches a refused address. */
 async function detectAuth(url) {
+  safeUpstreamUrl(url);
   try {
     const d = await discoverOauth(url);
     return d.as.registration_endpoint ? 'oauth' : 'app';
@@ -137,7 +138,13 @@ export async function appTool(R, name, args, consoleTool) {
       }
       if (!entry) return { error: 'pick an app from the directory, or give a URL' };
       let auth = entry.auth;
-      if (auth === 'detect') auth = await detectAuth(entry.url);
+      if (auth === 'detect') {
+        try {
+          auth = await detectAuth(entry.url);
+        } catch (e) {
+          return { error: e.message };
+        }
+      }
       const service = SERVICE.test(args.service || '') ? args.service : serviceId(entry.id === 'custom' ? entry.name : entry.id);
       const label = await freeLabel(env, me, service, args.label);
       if (!LABEL.test(label)) return { error: 'label must be 1-12 lowercase letters or digits (e.g. work, personal)' };

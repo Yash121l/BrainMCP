@@ -169,7 +169,8 @@ export function scrubSecrets(value, secrets = []) {
   if (!live.length) return value;
   const walk = (v, depth) => {
     if (typeof v === 'string') return live.some((x) => v.includes(x)) ? redact(v, live) : v;
-    if (depth > 20 || v == null || typeof v !== 'object') return v;
+    if (v == null || typeof v !== 'object') return v;
+    if (depth > 20) return '[removed by BrainMCP: nested too deep to check for secrets]';
     if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
     return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, depth + 1)]));
   };

@@ -1050,13 +1050,21 @@ const INGEST_MAX_AGE_DAYS = 8;
 const ROLLUP_PAGE = 1000; // rows read per query
 const ROLLUP_MAX_GROUPS = 100; // R2 objects written per run; the rest wait for the next run
 
-const SECRET_KEY = /pass(word|wd)?|secret|token|api[_-]?key|apikey|authorization|^auth$|cookie|session|private[_-]?key|credential/i;
+// Keys are compared with case and separators removed (X.Api.Key, api_key, apiKey all match).
+const SECRET_KEY = /passw(or)?d|passwd|secret|token|apikey|authorization|^auth$|cookie|session|privatekey|credential/;
+const isSecretKey = (k) => SECRET_KEY.test(String(k).toLowerCase().replace(/[^a-z0-9]/g, ''));
 
-/** A second scrub on the server: whatever a client sent, values under credential-like keys are dropped. */
+/**
+ * A second scrub on the server: whatever a client sent, a value under a credential-like
+ * key is dropped whole (strings, objects and arrays; numbers and booleans are kept, so
+ * max_tokens survives). Anything nested too deep to check is dropped too.
+ */
 function scrubKeys(v, depth = 0) {
-  if (depth > 12 || v == null || typeof v !== 'object') return v;
+  if (v == null || typeof v !== 'object') return v;
+  if (depth > 12) return '[redacted: too deep]';
   if (Array.isArray(v)) return v.map((x) => scrubKeys(x, depth + 1));
-  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, SECRET_KEY.test(k) && x != null && typeof x !== 'object' ? '[redacted]' : scrubKeys(x, depth + 1)]));
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k,
+    isSecretKey(k) && x != null && typeof x !== 'number' && typeof x !== 'boolean' ? '[redacted]' : scrubKeys(x, depth + 1)]));
 }
 
 /** Buffer a batch of redacted tool-call records into D1. */

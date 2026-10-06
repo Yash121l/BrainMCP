@@ -13,7 +13,8 @@ test('catalog: every featured app is https, unique, and says how it signs in', (
   const ids = new Set();
   for (const a of FEATURED) {
     assert.match(a.url, /^https:\/\//, a.id);
-    assert.ok(['oauth', 'token', 'app', 'none'].includes(a.auth), a.id);
+    assert.ok(['oauth', 'token', 'app', 'none', 'restricted'].includes(a.auth), a.id);
+    if (a.auth === 'restricted') assert.ok(a.note, `${a.id} explains why it is restricted`);
     assert.ok(!ids.has(a.id), `duplicate ${a.id}`);
     ids.add(a.id);
     if (a.auth === 'token' || a.auth === 'app') assert.ok(a.token_help && a.token_url, `${a.id} needs setup help`);
@@ -148,4 +149,28 @@ test('a per-agent level is a ceiling below everyone\'s level; renaming an accoun
   assert.equal((await rawTool(env, other, 'call_tool', { connection: 'gmail_work', tool: 'create_draft', arguments: {} })).isError, false);
   const pinned = env.DB.sqlite.prepare('SELECT pinned FROM api_keys WHERE id = ?').get(codex).pinned;
   assert.equal(pinned, '["gmail_work"]');
+});
+
+test('restricted apps explain themselves instead of starting a doomed sign-in', async () => {
+  const { env, cookie } = await bootstrap();
+  const r = await consoleTool(env, cookie, 'gw_connect_app', { app_id: 'canva' });
+  assert.equal(r.needs, 'restricted');
+  assert.match(r.error, /approved apps/);
+  assert.equal(env.DB.sqlite.prepare('SELECT COUNT(*) AS n FROM connections').get().n, 0);
+});
+
+test('a provider that refuses BrainMCP at its sign-in page is reported before the redirect', async () => {
+  const as = async (req) => {
+    const u = new URL(req.url);
+    if (u.pathname === '/.well-known/oauth-authorization-server') return Response.json({ issuer: 'https://auth.p.test', authorization_endpoint: 'https://auth.p.test/authorize', token_endpoint: 'https://auth.p.test/token', registration_endpoint: 'https://auth.p.test/register' });
+    if (u.pathname === '/register') return Response.json({ client_id: 'c1' }, { status: 201 });
+    if (u.pathname === '/authorize') return new Response('Invalid redirect URI.', { status: 400 });
+    return new Response('no', { status: 404 });
+  };
+  const mcp = async (req) => (new URL(req.url).pathname.startsWith('/.well-known/oauth-protected-resource')
+    ? Response.json({ resource: 'https://mcp.p.test/mcp', authorization_servers: ['https://auth.p.test'] }) : new Response('no', { status: 404 }));
+  const { env, cookie } = await bootstrap({ 'auth.p.test': as, 'mcp.p.test': mcp });
+  const r = await consoleTool(env, cookie, 'gw_connect_app', { name: 'Picky', service: 'picky', url: 'https://mcp.p.test/mcp', auth: 'oauth' });
+  assert.match(r.error, /refused BrainMCP/);
+  assert.equal(env.DB.sqlite.prepare('SELECT COUNT(*) AS n FROM connections').get().n, 0, 'nothing was saved');
 });

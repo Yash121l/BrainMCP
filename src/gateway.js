@@ -9,7 +9,7 @@ import { loadCredential, storeCredential, sealNote, hasVaultKek } from './vault.
 import { decide, deriveRisk, looksInjected, globMatch } from './policy.js';
 import {
   UpstreamSession, UpstreamAuthError, httpTransport, safeUpstreamUrl, discoverOauth, registerClient, authorizeUrl,
-  exchangeCode, refreshTokens, randomToken, pkceChallenge,
+  exchangeCode, refreshTokens, randomToken, pkceChallenge, preflightAuthorize,
 } from './upstream.js';
 
 export const RAW = Symbol.for('brainmcp.raw-mcp-result');
@@ -638,7 +638,9 @@ export async function startOauth(env, conn, { origin, userId, sessionToken, stat
     const existing = (await loadCredential(env, conn.id).catch(() => null)) || {};
     await storeCredential(env, conn.id, { ...existing, client_id: client.client_id, client_secret: client.client_secret });
   }
-  return authorizeUrl({ as: discovered.as, client, redirectUri: redirectUri(origin), state, challenge: await pkceChallenge(verifier), scope, resource: discovered.resource });
+  const url = authorizeUrl({ as: discovered.as, client, redirectUri: redirectUri(origin), state, challenge: await pkceChallenge(verifier), scope, resource: discovered.resource });
+  await preflightAuthorize(url);
+  return url;
 }
 
 /**

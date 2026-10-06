@@ -254,7 +254,7 @@ export type AppAccess = {
   custom_rules: number
 }
 
-export type AppAuth = 'oauth' | 'token' | 'app' | 'none' | 'detect'
+export type AppAuth = 'oauth' | 'token' | 'app' | 'none' | 'detect' | 'restricted'
 export type CatalogApp = {
   id: string
   name: string
@@ -262,6 +262,8 @@ export type CatalogApp = {
   url: string
   auth: AppAuth
   description: string
+  /** For restricted apps: why they can't connect, and any workaround. */
+  note?: string
   token_help?: string
   token_url?: string
   header_name?: string | null

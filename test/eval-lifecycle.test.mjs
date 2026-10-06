@@ -21,8 +21,9 @@ const VAULT_KEK = Buffer.alloc(32, 9).toString('base64');
 const SECRET = 'figma-pat-SECRET-0123456789';
 const ROOT = new URL('..', import.meta.url).pathname;
 
-// The production control schema (3) is whatever origin/main shipped.
-const V3_SQL = execFileSync('git', ['show', 'origin/main:schema.sql'], { cwd: ROOT, encoding: 'utf8' });
+// Control schema 3 as it shipped in 368fdf3, the last release before the gateway.
+const V3_COMMIT = '368fdf3';
+const V3_SQL = execFileSync('git', ['show', `${V3_COMMIT}:schema.sql`], { cwd: ROOT, encoding: 'utf8' });
 const DEV_SQL = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8');
 // The version the Worker migrates to (the gateway branch bumps it; read it, do not hard-code it).
 const TARGET_VERSION = /CONTROL_SCHEMA_VERSION = '(\d+)'/.exec(readFileSync(new URL('../src/schema.js', import.meta.url), 'utf8'))[1];
@@ -249,7 +250,7 @@ async function v3Database() {
 
 test('migration: src/audit.js is byte-identical to production (so the seeded v3 hash chain is faithful)', () => {
   for (const f of ['src/audit.js']) {
-    const prod = execFileSync('git', ['show', `origin/main:${f}`], { cwd: ROOT, encoding: 'utf8' });
+    const prod = execFileSync('git', ['show', `${V3_COMMIT}:${f}`], { cwd: ROOT, encoding: 'utf8' });
     assert.equal(readFileSync(new URL(`../${f}`, import.meta.url), 'utf8'), prod, `${f} changed since v3; the seed may not be faithful`);
   }
 });

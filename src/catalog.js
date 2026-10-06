@@ -1,9 +1,12 @@
 // The app directory behind one-click connect. FEATURED is hand-checked: every URL
-// answered an MCP request on 2026-10-06 (74 apps), and `auth` says how it signs in:
+// answered an MCP request on 2026-10-06 (74 apps; sign-in re-checked the same day), and `auth` says how it signs in:
 //   oauth  - one click: BrainMCP registers itself and sends you to the provider
 //   token  - paste an API token (token_help says where to make one)
 //   app    - the provider needs an OAuth app you register with them (client id/secret)
 //   none   - public, no sign-in
+//   restricted - the provider lets only its approved apps (Claude, Cursor, ...) sign in
+//            to its MCP server; shown with a note instead of a Connect button
+// scripts/check-catalog.mjs re-runs the real registration and sign-in check.
 // Anything else comes from the official MCP Registry, searched live.
 
 const REGISTRY = 'https://registry.modelcontextprotocol.io/v0/servers';
@@ -11,23 +14,35 @@ const REGISTRY = 'https://registry.modelcontextprotocol.io/v0/servers';
 const app = (id, name, category, url, auth, description, extra = {}) => ({ id, name, category, url, auth, description, ...extra });
 
 export const FEATURED = [
-  app('figma', 'Figma', 'Design', 'https://mcp.figma.com/mcp', 'oauth', 'Read designs, frames, components and variables.'),
-  app('canva', 'Canva', 'Design', 'https://mcp.canva.com/mcp', 'oauth', 'Find, create and export Canva designs.'),
+  app('figma', 'Figma', 'Design', 'https://mcp.figma.com/mcp', 'restricted', 'Read designs, frames, components and variables.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet. Instead, turn on the Dev Mode MCP server in the Figma desktop app and add it as a local server through the bridge: command npx, args -y mcp-remote http://127.0.0.1:3845/mcp.',
+  }),
+  app('canva', 'Canva', 'Design', 'https://mcp.canva.com/mcp', 'restricted', 'Find, create and export Canva designs.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('miro', 'Miro', 'Design', 'https://mcp.miro.com/', 'oauth', 'Read and edit Miro boards.'),
-  app('gamma', 'Gamma', 'Design', 'https://mcp.gamma.app/mcp', 'oauth', 'Generate decks and documents.'),
+  app('gamma', 'Gamma', 'Design', 'https://mcp.gamma.app/mcp', 'restricted', 'Generate decks and documents.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('linear', 'Linear', 'Work', 'https://mcp.linear.app/mcp', 'oauth', 'Issues, projects, cycles and comments.'),
   app('notion', 'Notion', 'Work', 'https://mcp.notion.com/mcp', 'oauth', 'Search and edit pages and databases.'),
   app('atlassian', 'Jira & Confluence', 'Work', 'https://mcp.atlassian.com/v1/mcp', 'oauth', 'Jira issues and Confluence pages.'),
-  app('monday', 'monday.com', 'Work', 'https://mcp.monday.com/mcp', 'oauth', 'Boards, items and updates.'),
+  app('monday', 'monday.com', 'Work', 'https://mcp.monday.com/mcp', 'restricted', 'Boards, items and updates.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('airtable', 'Airtable', 'Work', 'https://mcp.airtable.com/mcp', 'oauth', 'Bases, tables and records.'),
   app('granola', 'Granola', 'Meetings', 'https://mcp.granola.ai/mcp', 'oauth', 'Meeting notes and transcripts.'),
   app('fireflies', 'Fireflies', 'Meetings', 'https://api.fireflies.ai/mcp', 'oauth', 'Call transcripts and summaries.'),
   app('calendly', 'Calendly', 'Meetings', 'https://mcp.calendly.com', 'oauth', 'Event types and bookings.'),
   app('attio', 'Attio', 'Sales', 'https://mcp.attio.com/mcp', 'oauth', 'CRM records, lists and notes.'),
-  app('intercom', 'Intercom', 'Sales', 'https://mcp.intercom.com/mcp', 'oauth', 'Conversations and contacts.'),
+  app('intercom', 'Intercom', 'Sales', 'https://mcp.intercom.com/mcp', 'restricted', 'Conversations and contacts.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('stripe', 'Stripe', 'Finance', 'https://mcp.stripe.com', 'oauth', 'Customers, payments and invoices.'),
   app('paypal', 'PayPal', 'Finance', 'https://mcp.paypal.com/mcp', 'oauth', 'Orders, invoices and disputes.'),
-  app('square', 'Square', 'Finance', 'https://mcp.squareup.com/mcp', 'oauth', 'Payments, catalog and customers.'),
+  app('square', 'Square', 'Finance', 'https://mcp.squareup.com/mcp', 'restricted', 'Payments, catalog and customers.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('ramp', 'Ramp', 'Finance', 'https://mcp.ramp.com/mcp', 'oauth', 'Cards, spend and reimbursements.'),
   app('mercury', 'Mercury', 'Finance', 'https://mcp.mercury.com/mcp', 'oauth', 'Bank accounts and transactions.'),
   app('github', 'GitHub', 'Engineering', 'https://api.githubcopilot.com/mcp/', 'token', 'Repositories, issues and pull requests.', {
@@ -36,7 +51,9 @@ export const FEATURED = [
   }),
   app('gitlab', 'GitLab', 'Engineering', 'https://gitlab.com/api/v4/mcp', 'oauth', 'Projects, issues and merge requests.'),
   app('sentry', 'Sentry', 'Engineering', 'https://mcp.sentry.dev/mcp', 'oauth', 'Issues, events and releases.'),
-  app('vercel', 'Vercel', 'Engineering', 'https://mcp.vercel.com', 'oauth', 'Projects, deployments and logs.'),
+  app('vercel', 'Vercel', 'Engineering', 'https://mcp.vercel.com', 'restricted', 'Projects, deployments and logs.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('netlify', 'Netlify', 'Engineering', 'https://netlify-mcp.netlify.app/mcp', 'oauth', 'Sites, deploys and forms.'),
   app('supabase', 'Supabase', 'Engineering', 'https://mcp.supabase.com/mcp', 'oauth', 'Projects, tables and SQL.'),
   app('neon', 'Neon', 'Engineering', 'https://mcp.neon.tech/mcp', 'oauth', 'Postgres projects and branches.'),
@@ -44,7 +61,10 @@ export const FEATURED = [
   app('posthog', 'PostHog', 'Engineering', 'https://mcp.posthog.com/mcp', 'oauth', 'Product analytics and feature flags.'),
   app('semgrep', 'Semgrep', 'Engineering', 'https://mcp.semgrep.ai/mcp', 'oauth', 'Code scanning findings.'),
   app('jam', 'Jam', 'Engineering', 'https://mcp.jam.dev/mcp', 'oauth', 'Bug reports with replays.'),
-  app('dropbox', 'Dropbox', 'Files', 'https://mcp.dropbox.com/mcp', 'oauth', 'Files and folders.'),
+  app('dropbox', 'Dropbox', 'Files', 'https://mcp.dropbox.com/mcp', 'app', 'Files and folders.', {
+    token_help: 'Dropbox does not let apps register themselves: create an app at dropbox.com/developers (scoped access), add the redirect URL shown below, then paste its app key and secret.',
+    token_url: 'https://www.dropbox.com/developers/apps',
+  }),
   app('zapier', 'Zapier', 'Automation', 'https://mcp.zapier.com/api/mcp/mcp', 'oauth', 'Run the actions you set up in Zapier.'),
   app('apify', 'Apify', 'Automation', 'https://mcp.apify.com', 'oauth', 'Run scrapers and actors.'),
   app('deepwiki', 'DeepWiki', 'Knowledge', 'https://mcp.deepwiki.com/mcp', 'none', 'Docs for any public GitHub repository.'),
@@ -55,7 +75,9 @@ export const FEATURED = [
   app('todoist', 'Todoist', 'Work', 'https://ai.todoist.net/mcp', 'oauth', 'Tasks, projects and due dates.'),
   app('clickup', 'ClickUp', 'Work', 'https://mcp.clickup.com/mcp', 'oauth', 'Tasks, docs and spaces.'),
   app('coda', 'Coda', 'Work', 'https://coda.io/apis/mcp', 'oauth', 'Docs, tables and formulas.'),
-  app('cal', 'Cal.com', 'Meetings', 'https://mcp.cal.com/mcp', 'oauth', 'Bookings and availability.'),
+  app('cal', 'Cal.com', 'Meetings', 'https://mcp.cal.com/mcp', 'restricted', 'Bookings and availability.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('affinity', 'Affinity', 'Sales', 'https://mcp.affinity.co/mcp', 'app', 'Relationship CRM: people, companies, deals.', {
     token_help: 'Affinity accepts registered OAuth apps only: ask your Affinity admin for an MCP OAuth client, add the redirect URL shown below, then paste its client id and secret.',
     token_url: 'https://support.affinity.co/',
@@ -66,7 +88,9 @@ export const FEATURED = [
   app('similarweb', 'Similarweb', 'Marketing', 'https://mcp.similarweb.com/mcp', 'oauth', 'Website traffic and market intelligence.'),
   app('wix', 'Wix', 'Marketing', 'https://mcp.wix.com/mcp', 'oauth', 'Sites, stores and bookings.'),
   app('sanity', 'Sanity', 'Marketing', 'https://mcp.sanity.io', 'oauth', 'Structured content and documents.'),
-  app('pitchbook', 'PitchBook', 'Research', 'https://mcp.pitchbook.com/mcp', 'oauth', 'Companies, deals and investors.'),
+  app('pitchbook', 'PitchBook', 'Research', 'https://mcp.pitchbook.com/mcp', 'restricted', 'Companies, deals and investors.', {
+    note: 'The provider lets only approved apps (such as Claude, Cursor and VS Code) sign in to its MCP server, and BrainMCP is not on that list yet.',
+  }),
   app('crunchbase', 'Crunchbase', 'Research', 'https://mcp.crunchbase.com/mcp', 'app', 'Company and funding data.', {
     token_help: 'Crunchbase accepts registered OAuth apps only: create one in the Crunchbase data platform, add the redirect URL shown below, then paste its client id and secret.',
     token_url: 'https://data.crunchbase.com/',

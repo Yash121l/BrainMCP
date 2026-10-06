@@ -52,3 +52,16 @@ test('a claim abandoned mid-way grants nothing and can be taken over after two m
   const got = await (await http(env, 'POST', '/device/token', { body: { device_code: s.device_code } })).json();
   assert.deepEqual(Object.keys(got.keys), ['claude-code', 'codex']);
 });
+
+test('a losing device approval never changes the machine\'s tags', async () => {
+  const { env, cookie } = await bootstrap();
+  const s = await start(env);
+  const results = await Promise.all([
+    consoleTool(env, cookie, 'gw_device_approve', { user_code: s.user_code, machine_tags: ['winner'] }),
+    consoleTool(env, cookie, 'gw_device_approve', { user_code: s.user_code, machine_tags: ['loser'] }),
+  ]);
+  const won = results.find((r) => r.ok);
+  assert.ok(won);
+  const tags = JSON.parse(env.DB.sqlite.prepare("SELECT tags FROM machines WHERE name = 'box'").get().tags);
+  assert.deepEqual(tags, results[0].ok ? ['winner'] : ['loser']);
+});

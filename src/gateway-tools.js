@@ -778,7 +778,9 @@ async function consoleTool(R, name, args) {
           env.DB.prepare("UPDATE device_codes SET status = 'approved', key_sealed = ? WHERE device_hash = ? AND status = 'approving' AND claim_id = ? AND exp > datetime('now')")
             .bind(sealed, row.device_hash, claimId),
           ...prepared.map((k) => k.stmt),
-          ...(machineTags !== undefined ? [env.DB.prepare('UPDATE machines SET tags = ? WHERE id = ?').bind(JSON.stringify(machineTags), machine.id)] : []),
+          ...(machineTags !== undefined ? [env.DB.prepare(
+            "UPDATE machines SET tags = ? WHERE id = ? AND EXISTS (SELECT 1 FROM device_codes WHERE device_hash = ? AND status = 'approved' AND claim_id = ?)"
+          ).bind(JSON.stringify(machineTags), machine.id, row.device_hash, claimId)] : []),
         ]);
         if ((results[0].meta?.changes ?? 0) !== 1) {
           await env.DB.prepare("UPDATE device_codes SET status = 'pending', claim_id = NULL WHERE device_hash = ? AND status = 'approving' AND claim_id = ?").bind(row.device_hash, claimId).run();

@@ -137,6 +137,7 @@ export async function appTool(R, name, args, consoleTool) {
         entry = { id: args.app_id || args.name || 'custom', name: args.name || 'Custom app', url: String(args.url), auth: args.auth || 'detect', header_name: args.header_name || null };
       }
       if (!entry) return { error: 'pick an app from the directory, or give a URL' };
+      if (entry.auth === 'restricted') return { error: `${entry.name} is not available yet: ${entry.note}`, needs: 'restricted', note: entry.note };
       let auth = entry.auth;
       if (auth === 'detect') {
         try {

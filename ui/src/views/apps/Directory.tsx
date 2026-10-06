@@ -156,11 +156,13 @@ export function Directory({
   }, [catalog])
 
   const q = query.trim().toLowerCase()
-  const featured = (catalog?.featured ?? []).filter(
-    (a) =>
-      (category === 'All' || a.category === category) &&
-      (!q || `${a.name} ${a.category} ${a.description}`.toLowerCase().includes(q)),
-  )
+  const featured = (catalog?.featured ?? [])
+    .filter(
+      (a) =>
+        (category === 'All' || a.category === category) &&
+        (!q || `${a.name} ${a.category} ${a.description}`.toLowerCase().includes(q)),
+    )
+    .sort((a, b) => Number(a.auth === 'restricted') - Number(b.auth === 'restricted'))
 
   const done = (id: string | null) => {
     onConnected(id)
@@ -336,6 +338,7 @@ const AUTH_PILL: Record<string, { label: string; title: string }> = {
   token: { label: 'API token', title: 'Paste a token you create in the app.' },
   app: { label: 'Needs setup', title: 'The app asks you to register your own OAuth app first.' },
   detect: { label: 'Community', title: 'From the public MCP Registry; BrainMCP checks how it signs in when you connect.' },
+  restricted: { label: 'Not available yet', title: 'The provider lets only its approved apps sign in to its MCP server.' },
 }
 
 type Mode = 'idle' | 'token' | 'app'
@@ -553,7 +556,9 @@ export function AppTile({
         </form>
       ) : (
         <div className="mt-auto flex flex-wrap items-center gap-2 pt-3">
-          {existing.length > 0 ? (
+          {auth === 'restricted' ? (
+            <p className="text-[11px] leading-relaxed text-muted-foreground">{app.note}</p>
+          ) : existing.length > 0 ? (
             <>
               <Pill tone="green" dot className="max-w-full truncate" title={existing.map((c) => c.connection).join(', ')}>
                 {existing.length === 1

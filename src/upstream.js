@@ -330,10 +330,43 @@ export async function registerClient(as, redirectUri, staticClient = null) {
     signal: AbortSignal.timeout(15000),
   });
   const body = await readCapped(res, 64 * 1024);
-  if (!res.ok) throw new Error(`client registration failed (${res.status}): ${body.slice(0, 200)}`);
+  if (!res.ok) {
+    const e = new Error(/redirect|not allowed|not supported|forbidden/i.test(body) || res.status === 403
+      ? 'this provider lets only its approved apps sign in to its MCP server, and BrainMCP is not one of them; if it offers OAuth apps, connect with your own client id and secret instead'
+      : `client registration failed (${res.status}): ${body.slice(0, 200)}`);
+    e.restricted = true;
+    throw e;
+  }
   const j = JSON.parse(body);
   if (!j.client_id) throw new Error('client registration returned no client_id');
   return { client_id: j.client_id, client_secret: j.client_secret || null };
+}
+
+/**
+ * Load the provider's sign-in page before sending the person there. A 400 that names
+ * the redirect or the client means the provider will refuse BrainMCP at its door, so
+ * say that now instead of stranding them on its error page. Bot challenges and
+ * anything unclear count as fine: only a clear refusal stops the flow.
+ */
+export async function preflightAuthorize(url) {
+  let res;
+  try {
+    res = await fetch(safeUpstreamUrl(url), { redirect: 'manual', headers: { Accept: 'text/html' }, signal: AbortSignal.timeout(8000) });
+  } catch {
+    return;
+  }
+  const loc = res.headers.get('location') || '';
+  if (/[?&]error=(invalid_request|unauthorized_client|invalid_client|access_denied)/.test(loc) && /redirect|client/i.test(decodeURIComponent(loc))) {
+    throw new Error('the provider refused BrainMCP\'s sign-in request (it accepts only approved apps); connect it with your own OAuth client, or not at all');
+  }
+  if (res.status === 400 || res.status === 401) {
+    const text = (await readCapped(res, 32 * 1024).catch(() => '')).replace(/<[^>]+>/g, ' ');
+    if (/invalid[_ ]redirect|redirect[_ ]uri|unauthorized[_ ]client|invalid[_ ]client|unknown client/i.test(text)) {
+      throw new Error('the provider refused BrainMCP\'s sign-in address (it accepts only approved apps); connect it with your own OAuth client, or not at all');
+    }
+  } else {
+    await res.body?.cancel().catch(() => {});
+  }
 }
 
 export function authorizeUrl({ as, client, redirectUri, state, challenge, scope, resource }) {

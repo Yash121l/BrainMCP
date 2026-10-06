@@ -3,6 +3,7 @@ import { newDataKey, hasKek, KEK_VERSION, encryptWithKek } from './crypto.js';
 import { spaceStore } from './store.js';
 import { normalizeProject } from './parse.js';
 import { resolveSkillsFor, parseSkillsConfig } from './skills.js';
+import { dropSpaceVectors } from './memory.js';
 
 export const SYSTEM_HANDLE = 'system';
 export const HANDLE = /^[a-z0-9][a-z0-9-]{1,30}$/;
@@ -246,6 +247,7 @@ export async function createInvite(env, userId, createdBy) {
 export async function deleteUser(env, userId, { purge = false } = {}) {
   const owned = (await env.DB.prepare('SELECT * FROM spaces WHERE owner_id = ?').bind(userId).all()).results;
   for (const space of owned) {
+    await dropSpaceVectors(env, space.id).catch((e) => console.log('vector cleanup failed', space.id, e.message));
     if (space.backing === 'hosted' && space.status === 'active' && env.SPACES) {
       await spaceStore(env, space).call('destroy', {}).catch((e) => console.log('space destroy failed', space.id, e.message));
     }
@@ -258,6 +260,19 @@ export async function deleteUser(env, userId, { purge = false } = {}) {
   }
   const keys = (await env.DB.prepare('SELECT id FROM api_keys WHERE user_id = ?').bind(userId).all()).results;
   for (const k of keys) await revokeKey(env, k.id);
+  const conns = JSON.stringify((await env.DB.prepare('SELECT id FROM connections WHERE owner_id = ?').bind(userId).all()).results.map((c) => c.id));
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM credentials WHERE connection_id IN (SELECT value FROM json_each(?))').bind(conns),
+    env.DB.prepare('DELETE FROM connection_tools WHERE connection_id IN (SELECT value FROM json_each(?))').bind(conns),
+    env.DB.prepare('DELETE FROM tool_fts WHERE connection_id IN (SELECT value FROM json_each(?))').bind(conns),
+    env.DB.prepare('DELETE FROM connection_grants WHERE grantee_id = ? OR connection_id IN (SELECT value FROM json_each(?))').bind(userId, conns),
+    env.DB.prepare('DELETE FROM connect_flows WHERE user_id = ? OR connection_id IN (SELECT value FROM json_each(?))').bind(userId, conns),
+    env.DB.prepare('DELETE FROM approvals WHERE user_id = ? OR connection_id IN (SELECT value FROM json_each(?))').bind(userId, conns),
+    env.DB.prepare('DELETE FROM rules WHERE owner_id = ?').bind(userId),
+    env.DB.prepare('DELETE FROM connections WHERE owner_id = ?').bind(userId),
+    env.DB.prepare("UPDATE machines SET revoked = 1, name = name || '~' || id WHERE user_id = ? AND revoked = 0").bind(userId),
+    env.DB.prepare('DELETE FROM device_codes WHERE user_id = ?').bind(userId),
+  ]);
   const ids = JSON.stringify(owned.map((s) => s.id));
   const stmts = [
     env.DB.prepare('DELETE FROM shares WHERE grantee_id = ? OR space_id IN (SELECT value FROM json_each(?))').bind(userId, ids),

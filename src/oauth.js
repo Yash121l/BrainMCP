@@ -7,6 +7,7 @@
 
 import { resolvePrincipal, parentKey, roleWithoutSuper } from './auth.js';
 import { auditInBackground } from './audit.js';
+import { safeUpstreamUrl } from './upstream.js';
 
 const enc = new TextEncoder();
 
@@ -62,8 +63,42 @@ function validRedirectUri(u) {
  * match one the client registered (clients that registered none get nothing) and PKCE
  * S256 is mandatory. Returns { client } or { error }.
  */
+const CIMD_MAX_BYTES = 5 * 1024;
+const CIMD_TTL_MS = 24 * 3600 * 1000;
+
+/** A client_id that is itself an https URL names a Client ID Metadata Document. */
+const isMetadataClientId = (id) => /^https:\/\/[^/]+\/.+/.test(String(id || ''));
+
+/**
+ * Fetch (or reuse a fresh copy of) a Client ID Metadata Document and record it as a
+ * client. The document must name itself as client_id; its redirect_uris obey the same
+ * rules as dynamic registration.
+ */
+async function metadataClient(env, clientId) {
+  const cached = await env.DB.prepare('SELECT * FROM oauth_clients WHERE client_id = ?').bind(clientId).first();
+  if (cached && Date.now() - Date.parse(`${String(cached.created).replace(' ', 'T')}Z`) < CIMD_TTL_MS) return cached;
+  let doc;
+  try {
+    const res = await fetch(safeUpstreamUrl(clientId), { headers: { Accept: 'application/json' }, redirect: 'manual', signal: AbortSignal.timeout(5000) });
+    const raw = res.ok ? await readCapped(res, CIMD_MAX_BYTES) : null;
+    doc = raw ? JSON.parse(raw) : null;
+  } catch {
+    doc = null;
+  }
+  if (!doc || doc.client_id !== clientId) return null;
+  const uris = doc.redirect_uris;
+  if (!Array.isArray(uris) || !uris.length || uris.length > MAX_REDIRECT_URIS || !uris.every(validRedirectUri)) return null;
+  const name = typeof doc.client_name === 'string' ? doc.client_name.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, MAX_CLIENT_NAME) : null;
+  await env.DB.prepare("INSERT OR REPLACE INTO oauth_clients (client_id, redirect_uris, client_name, created, metadata_url) VALUES (?, ?, ?, datetime('now'), ?)")
+    .bind(clientId, JSON.stringify(uris), name || new URL(clientId).host, clientId).run();
+  return env.DB.prepare('SELECT * FROM oauth_clients WHERE client_id = ?').bind(clientId).first();
+}
+
 async function checkAuthorizeRequest(env, get) {
-  const client = await env.DB.prepare('SELECT * FROM oauth_clients WHERE client_id = ?').bind(get('client_id') || '').first();
+  const id = get('client_id') || '';
+  const client = isMetadataClientId(id)
+    ? await metadataClient(env, id)
+    : await env.DB.prepare('SELECT * FROM oauth_clients WHERE client_id = ?').bind(id).first();
   if (!client) return { error: 'unknown client_id' };
   let uris;
   try { uris = JSON.parse(client.redirect_uris || '[]'); } catch { uris = []; }
@@ -86,6 +121,8 @@ export function oauthMetadata(origin) {
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
     scopes_supported: ['brain'],
+    authorization_response_iss_parameter_supported: true,
+    client_id_metadata_document_supported: true,
   };
 }
 
@@ -146,7 +183,12 @@ export async function handleOauth(req, env, url, ctx) {
     const checked = await checkAuthorizeRequest(env, (k) => q.get(k));
     if (checked.error) return new Response(checked.error, { status: 400 });
     const clientName = checked.client.client_name || 'An unnamed client';
-    const host = new URL(checked.redirect_uri).host;
+    const redirect = new URL(checked.redirect_uri);
+    const host = redirect.host;
+    const loopback = redirect.hostname === 'localhost' || redirect.hostname === '127.0.0.1';
+    const identity = checked.client.metadata_url
+      ? `Its identity is published at <b>${esc(new URL(checked.client.metadata_url).host)}</b>.`
+      : '(name chosen by the client, unverified)';
     const params = ['client_id', 'redirect_uri', 'state', 'code_challenge', 'code_challenge_method', 'scope']
       .map((k) => `<input type="hidden" name="${k}" value="${esc(q.get(k) || '')}">`)
       .join('\n');
@@ -154,8 +196,9 @@ export async function handleOauth(req, env, url, ctx) {
 <style>body{font-family:-apple-system,sans-serif;max-width:26rem;margin:15vh auto;padding:0 1rem;color:#eee;background:#111}
 input[type=password]{width:100%;padding:.6rem;font-size:1rem;border-radius:6px;border:1px solid #444;background:#1c1c1c;color:#eee}
 button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;border:0;background:#c96442;color:#fff;cursor:pointer}</style></head>
-<body><h2>🧠 BrainMCP</h2><p><b>${esc(clientName)}</b> (name chosen by the client, unverified) is requesting access to the brain.</p>
+<body><h2><svg width="28" height="28" style="vertical-align:-7px;margin-right:8px" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">  <defs>    <linearGradient id="bm-g" x1="10" y1="8" x2="54" y2="58" gradientUnits="userSpaceOnUse">      <stop offset="0" stop-color="#5EEAD4"/>      <stop offset="0.5" stop-color="#60A5FA"/>      <stop offset="1" stop-color="#A78BFA"/>    </linearGradient>  </defs>  <rect width="64" height="64" rx="15" fill="#0B1022"/>  <path d="M28.5 12.5c-8.6 0-15 5.8-15 13.6 0 3 .9 5.6 2.6 7.6-1.6 1.9-2.6 4.3-2.6 6.9 0 6.1 5 10.9 11.4 10.9h3.6" stroke="url(#bm-g)" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>  <path d="M35.5 12.5c8.6 0 15 5.8 15 13.6 0 3-.9 5.6-2.6 7.6 1.6 1.9 2.6 4.3 2.6 6.9 0 6.1-5 10.9-11.4 10.9h-3.6" stroke="url(#bm-g)" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>  <path d="M32 32 21.5 23.5M32 32l10.5-8.5M32 32 22 42.5M32 32l10 10.5M32 32v14" stroke="url(#bm-g)" stroke-width="2.4" stroke-linecap="round" opacity=".85"/>  <circle cx="21.5" cy="23.5" r="3.1" fill="url(#bm-g)"/>  <circle cx="42.5" cy="23.5" r="3.1" fill="url(#bm-g)"/>  <circle cx="22" cy="42.5" r="3.1" fill="url(#bm-g)"/>  <circle cx="42" cy="42.5" r="3.1" fill="url(#bm-g)"/>  <circle cx="32" cy="32" r="6.4" fill="#F8FAFC"/>  <circle cx="32" cy="46.5" r="2.6" fill="url(#bm-g)"/></svg>BrainMCP</h2><p><b>${esc(clientName)}</b> ${identity} is requesting access to the brain.</p>
 <p>Access will be sent to <b>${esc(host)}</b>. Only continue if you started this connection and recognise that host.</p>
+${loopback ? '<p><b>Warning:</b> access goes to a program on this computer. Any local program can claim this name. Continue only if you just started the login from a terminal or app here.</p>' : ''}
 <p>Paste your access key. The connection inherits that key's scopes.</p>
 <form method="POST" action="/authorize">${params}
 <input type="password" name="access_key" placeholder="access key" autofocus required>
@@ -180,6 +223,7 @@ button{margin-top:.8rem;padding:.6rem 1.4rem;font-size:1rem;border-radius:6px;bo
     auditInBackground({ env, ctx, p: principal }, 'oauth.consent', { detail: { client: checked.client.client_id, host: dest.host } });
     dest.searchParams.set('code', code);
     if (get('state')) dest.searchParams.set('state', get('state'));
+    dest.searchParams.set('iss', url.origin);
     return Response.redirect(dest.toString(), 302);
   }
 

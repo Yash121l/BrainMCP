@@ -15,7 +15,7 @@ const superSpace = (env) => env.DB.prepare(
     WHERE u.is_super = 1 AND s.kind = 'personal' AND s.backing = 'git' AND s.status = 'active' ORDER BY s.created LIMIT 1`
 ).first();
 
-const sessionCookie = (req) => (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/)?.[1] || null;
+export const sessionCookie = (req) => (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/)?.[1] || null;
 
 async function sessionPrincipal(req, env) {
   const tok = sessionCookie(req);
@@ -128,7 +128,9 @@ export async function computeHygiene(db, p) {
 function rejectCrossOrigin(req, url) {
   if (req.method === 'GET' || req.method === 'HEAD') return null;
   const origin = req.headers.get('Origin');
-  return origin && origin !== url.origin ? Response.json({ error: 'cross-origin request refused' }, { status: 403 }) : null;
+  const site = req.headers.get('Sec-Fetch-Site');
+  if ((origin && origin !== url.origin) || site === 'cross-site') return Response.json({ error: 'cross-origin request refused' }, { status: 403 });
+  return null;
 }
 
 const accessOf = (pv) => (pv.via === 'member' ? pv.memberRole : pv.via);
@@ -148,10 +150,16 @@ export async function handleApp(req, env, url, ctx, callTool = null) {
   await ensureSchema(env);
 
   if (url.pathname === '/app/login' && req.method === 'POST') {
+    const crossSite = rejectCrossOrigin(req, url);
+    if (crossSite) return crossSite;
     const form = await req.formData();
     const principal = await resolvePrincipal(env, form.get('access_key') || '');
     if (!principal) return new Response('invalid or revoked key', { status: 403 });
     if (!principal.keyId) return new Response('this credential cannot open a web session', { status: 403 });
+    // The console approves agents' calls, so an agent's own credential must not open it:
+    // not a key bound to a machine or agent, and not a connector token.
+    if (principal.via === 'oauth' && principal.name !== 'webapp') return new Response('a connector token cannot open a web session; sign in with your access key', { status: 403 });
+    if (principal.machineId || principal.agent) return new Response('this key belongs to an agent on a machine and cannot open the console; sign in with your own access key', { status: 403 });
     const tok = randToken(32);
     // A session never outlives the key it was minted from.
     await env.DB.prepare(
@@ -192,7 +200,7 @@ export async function handleApp(req, env, url, ctx, callTool = null) {
     if (!principal) return Response.json({ error: 'unauthorized' }, { status: 401 });
     const crossOrigin = rejectCrossOrigin(req, url);
     if (crossOrigin) return crossOrigin;
-    const R = { env, ctx, p: principal, url };
+    const R = { env, ctx, p: principal, url, sessionToken: sessionCookie(req) };
 
     if (url.pathname === '/app/api/tool' && req.method === 'POST' && callTool) {
       if (env.MCP_LIMITER && !(await env.MCP_LIMITER.limit({ key: principal.keyId || 'root' })).success) {

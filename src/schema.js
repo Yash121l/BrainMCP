@@ -1,6 +1,6 @@
 import { randToken } from './auth.js';
 
-const CONTROL_SCHEMA_VERSION = '3';
+const CONTROL_SCHEMA_VERSION = '6';
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -32,6 +32,52 @@ const DDL = [
   'CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events (actor_user, id)',
   'CREATE INDEX IF NOT EXISTS idx_audit_space ON audit_events (space_id, id)',
   'CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_events (subject_user, id)',
+  `CREATE TABLE IF NOT EXISTS machines (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]',
+     created TEXT, last_seen TEXT, revoked INTEGER NOT NULL DEFAULT 0, UNIQUE (user_id, name))`,
+  `CREATE TABLE IF NOT EXISTS connections (
+     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, space_id TEXT, service TEXT NOT NULL, label TEXT NOT NULL,
+     transport TEXT NOT NULL, url TEXT NOT NULL, auth_kind TEXT NOT NULL, header_name TEXT,
+     account TEXT, workspace TEXT, status TEXT NOT NULL, trust TEXT NOT NULL DEFAULT 'untrusted',
+     sensitivity TEXT NOT NULL DEFAULT 'private', default_for TEXT NOT NULL DEFAULT '[]', oauth TEXT,
+     last_sync TEXT, last_error TEXT, created TEXT, created_by_key TEXT)`,
+  'CREATE INDEX IF NOT EXISTS idx_connections_owner ON connections (owner_id)',
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_connections_name ON connections (owner_id, service, label)',
+  `CREATE TABLE IF NOT EXISTS credentials (
+     connection_id TEXT PRIMARY KEY, kek_version INTEGER NOT NULL, wrapped_dek TEXT NOT NULL,
+     sealed TEXT NOT NULL, updated TEXT)`,
+  `CREATE TABLE IF NOT EXISTS connection_tools (
+     connection_id TEXT NOT NULL, name TEXT NOT NULL, title TEXT, description TEXT, input_schema TEXT,
+     output_schema TEXT, annotations TEXT, manifest_hash TEXT NOT NULL, approved_hash TEXT,
+     risk TEXT NOT NULL, risk_override TEXT, egress INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
+     first_seen TEXT, changed TEXT, approved_description TEXT, egress_override INTEGER, PRIMARY KEY (connection_id, name))`,
+  'CREATE VIRTUAL TABLE IF NOT EXISTS tool_fts USING fts5(connection_id UNINDEXED, name, text)',
+  `CREATE TABLE IF NOT EXISTS connection_grants (
+     connection_id TEXT NOT NULL, grantee_id TEXT NOT NULL, tools TEXT NOT NULL DEFAULT '[]', expires TEXT,
+     accepted INTEGER NOT NULL DEFAULT 0, granted_by TEXT, created TEXT, PRIMARY KEY (connection_id, grantee_id))`,
+  `CREATE TABLE IF NOT EXISTS rules (
+     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, effect TEXT NOT NULL, subject TEXT NOT NULL,
+     resource TEXT NOT NULL, note TEXT, enabled INTEGER NOT NULL DEFAULT 1, global INTEGER NOT NULL DEFAULT 0,
+     created TEXT, updated TEXT)`,
+  'CREATE INDEX IF NOT EXISTS idx_rules_owner ON rules (owner_id)',
+  `CREATE TABLE IF NOT EXISTS approvals (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, key_id TEXT, connection_id TEXT NOT NULL, tool TEXT NOT NULL,
+     args_hash TEXT NOT NULL, args_sealed TEXT, reason TEXT, taint TEXT, status TEXT NOT NULL,
+     scope TEXT, decided_by TEXT, created TEXT, decided TEXT, expires TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)`,
+  'CREATE INDEX IF NOT EXISTS idx_approvals_user ON approvals (user_id, status)',
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_pending ON approvals (user_id, key_id, connection_id, tool, args_hash) WHERE status = 'pending'",
+  `CREATE TABLE IF NOT EXISTS taint (
+     key_id TEXT NOT NULL, label TEXT NOT NULL, source TEXT NOT NULL, exp TEXT NOT NULL,
+     PRIMARY KEY (key_id, label, source))`,
+  `CREATE TABLE IF NOT EXISTS connect_flows (
+     state_hash TEXT PRIMARY KEY, connection_id TEXT NOT NULL, user_id TEXT NOT NULL, session_hash TEXT NOT NULL,
+     verifier TEXT NOT NULL, redirect_uri TEXT NOT NULL, exp TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS embeddings (
+     space_id TEXT NOT NULL, path TEXT NOT NULL, hash TEXT NOT NULL, vector_id TEXT NOT NULL, updated TEXT,
+     PRIMARY KEY (space_id, path))`,
+  `CREATE TABLE IF NOT EXISTS device_codes (
+     device_hash TEXT PRIMARY KEY, user_code TEXT UNIQUE NOT NULL, machine TEXT NOT NULL, agent TEXT,
+     status TEXT NOT NULL, key_sealed TEXT, user_id TEXT, exp TEXT NOT NULL, created TEXT)`,
 ];
 
 const COLUMNS = [
@@ -42,6 +88,14 @@ const COLUMNS = [
   ['api_keys', 'parent_key_id', 'TEXT'],
   ['members', 'accepted', 'INTEGER NOT NULL DEFAULT 1'],
   ['shares', 'accepted', 'INTEGER NOT NULL DEFAULT 1'],
+  ['api_keys', 'machine_id', 'TEXT'],
+  ['api_keys', 'agent', 'TEXT'],
+  ['api_keys', 'agent_tags', "TEXT NOT NULL DEFAULT '[]'"],
+  ['api_keys', 'pinned', "TEXT NOT NULL DEFAULT '[]'"],
+  ['users', 'notify_url', 'TEXT'],
+  ['oauth_clients', 'metadata_url', 'TEXT'],
+  ['connection_tools', 'approved_description', 'TEXT'],
+  ['connection_tools', 'egress_override', 'INTEGER'],
 ];
 
 const ready = new WeakMap();
@@ -57,7 +111,11 @@ async function migrate(env) {
   await env.DB.batch(DDL.map((sql) => env.DB.prepare(sql)));
   for (const [table, column, type] of COLUMNS) {
     const cols = (await env.DB.prepare(`PRAGMA table_info(${table})`).all()).results.map((c) => c.name);
-    if (!cols.includes(column)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`).run();
+    if (cols.includes(column)) continue;
+    // another isolate may be running the same migration right now
+    await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`).run().catch((e) => {
+      if (!/duplicate column/i.test(e.message)) throw e;
+    });
   }
   await bootstrapSuper(env);
   await env.DB.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('control_schema', ?)").bind(CONTROL_SCHEMA_VERSION).run();

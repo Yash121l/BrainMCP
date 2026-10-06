@@ -70,3 +70,15 @@ test('auto-detection never sends a request to an address the URL policy refuses'
   }
   assert.equal(touched, 0);
 });
+
+test('a device approval interrupted mid-way can be taken over after two minutes, not before', async () => {
+  const { env, cookie } = await bootstrap();
+  const s = await (await http(env, 'POST', '/device/code', { body: { machine: 'box', agents: ['codex'] } })).json();
+  env.DB.sqlite.prepare("UPDATE device_codes SET status = 'approving', claimed = datetime('now') WHERE user_code = ?").run(s.user_code);
+  assert.match((await consoleTool(env, cookie, 'gw_device_approve', { user_code: s.user_code })).error, /unknown or expired|already decided/);
+  assert.equal((await (await http(env, 'POST', '/device/token', { body: { device_code: s.device_code } })).json()).error, 'authorization_pending');
+  env.DB.sqlite.prepare("UPDATE device_codes SET claimed = datetime('now', '-3 minutes') WHERE user_code = ?").run(s.user_code);
+  assert.equal((await consoleTool(env, cookie, 'gw_device_lookup', { user_code: s.user_code })).machine, 'box');
+  assert.equal((await consoleTool(env, cookie, 'gw_device_approve', { user_code: s.user_code })).ok, true);
+  assert.ok((await (await http(env, 'POST', '/device/token', { body: { device_code: s.device_code } })).json()).keys.codex);
+});

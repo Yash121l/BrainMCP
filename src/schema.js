@@ -1,6 +1,6 @@
 import { randToken } from './auth.js';
 
-const CONTROL_SCHEMA_VERSION = '6';
+const CONTROL_SCHEMA_VERSION = '7';
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -96,6 +96,8 @@ const COLUMNS = [
   ['oauth_clients', 'metadata_url', 'TEXT'],
   ['connection_tools', 'approved_description', 'TEXT'],
   ['connection_tools', 'egress_override', 'INTEGER'],
+  ['device_codes', 'claimed', 'TEXT'],
+  ['device_codes', 'claim_id', 'TEXT'],
 ];
 
 const ready = new WeakMap();

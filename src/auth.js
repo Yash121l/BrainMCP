@@ -240,8 +240,13 @@ const expiresSql = (days) =>
   days == null || days === '' ? 'NULL' : `datetime('now', '+${Math.max(1, Math.min(3650, Number(days) | 0))} days')`;
 
 /** Create a key. Returns { id, key } — the plaintext key is shown exactly once. */
-export async function createKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null,
-  machine_id = null, agent = null, agent_tags = [], pinned = [] }) {
+/**
+ * The INSERT for a new key, not yet run, plus the plaintext key (shown once). `guard`
+ * turns it into INSERT ... SELECT ... WHERE <guard>, so a batch can make the key exist
+ * only if another row in the same transaction says so.
+ */
+export async function prepareKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null,
+  machine_id = null, agent = null, agent_tags = [], pinned = [] }, guard = null) {
   if (!ROLES.includes(role)) throw new Error('role must be read|write|admin|super');
   if (role === 'super' && (expires_days == null || expires_days === '')) expires_days = 7;
   if (role === 'super' && Number(expires_days) > 7) throw new Error('super keys expire within 7 days');
@@ -249,11 +254,20 @@ export async function createKey(env, { name, role = 'read', prefixes = [], expir
   checkGrant(role, scopes);
   const id = 'k_' + randToken(6);
   const key = 'bk_' + randToken(24);
-  await env.DB.prepare(
-    `INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked, user_id, space_limit, parent_key_id, machine_id, agent, agent_tags, pinned)
-     VALUES (?, ?, ?, ?, ?, datetime('now'), ${expires_at ? 'datetime(?)' : expiresSql(expires_days)}, 0, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(...[id, await sha256hex(key), String(name || id).slice(0, 100), role, JSON.stringify(scopes), ...(expires_at ? [expires_at] : []),
-    user_id, space_limit ? JSON.stringify(space_limit) : null, parent_key_id, machine_id, agent, JSON.stringify(agent_tags || []), JSON.stringify(pinned || [])]).run();
+  const values = `?, ?, ?, ?, ?, datetime('now'), ${expires_at ? 'datetime(?)' : expiresSql(expires_days)}, 0, ?, ?, ?, ?, ?, ?, ?`;
+  const binds = [id, await sha256hex(key), String(name || id).slice(0, 100), role, JSON.stringify(scopes), ...(expires_at ? [expires_at] : []),
+    user_id, space_limit ? JSON.stringify(space_limit) : null, parent_key_id, machine_id, agent, JSON.stringify(agent_tags || []), JSON.stringify(pinned || [])];
+  const cols = 'INSERT INTO api_keys (id, key_hash, name, role, prefixes, created, expires, revoked, user_id, space_limit, parent_key_id, machine_id, agent, agent_tags, pinned)';
+  const stmt = guard
+    ? env.DB.prepare(`${cols} SELECT ${values} WHERE ${guard.sql}`).bind(...binds, ...guard.binds)
+    : env.DB.prepare(`${cols} VALUES (${values})`).bind(...binds);
+  return { id, key, stmt };
+}
+
+/** Create a key. Returns { id, key } — the plaintext key is shown exactly once. */
+export async function createKey(env, opts) {
+  const { id, key, stmt } = await prepareKey(env, opts);
+  await stmt.run();
   return { id, key };
 }
 

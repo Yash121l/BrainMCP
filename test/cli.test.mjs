@@ -897,3 +897,28 @@ test('a partial apply --shell keeps the exports of harnesses configured earlier'
   assert.match(rc, /BRAIN_KEY_CURSOR/, 'reapplying codex alone must not drop cursor');
   assert.match(rc, /^# mine$/m);
 });
+
+test('apply --shell after upgrading from a manifest without shellAgents keeps the earlier exports', async () => {
+  const h = freshHome();
+  for (const d of ['.codex', '.cursor']) fs.mkdirSync(path.join(h, d), { recursive: true });
+  fs.writeFileSync(path.join(h, '.zshrc'), '');
+  const deps = () => ({ home: h, creds: { server: SERVER, key: 'bk_cli', keys: { cli: 'bk_cli', codex: 'bk_cx', cursor: 'bk_cur' } }, which: () => null, selfCommand: '/abs/brain', bundle: null, fx: quietFx() });
+  const first = await cli.runApply({ only: 'codex,cursor', shell: true }, deps());
+  const manifestPath = Object.keys(first).includes('manifestPath') ? first.manifestPath : path.join(h, '.config', 'brain', 'manifest.json');
+  const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  delete m.shellAgents;
+  fs.writeFileSync(manifestPath, JSON.stringify(m));
+  await cli.runApply({ only: 'codex', shell: true }, deps());
+  assert.match(fs.readFileSync(path.join(h, '.zshrc'), 'utf8'), /BRAIN_KEY_CURSOR/);
+});
+
+test('telemetry redaction drops numeric credentials and keeps token counters', () => {
+  const r = cli.redact({ password: 271828, pin: 1234, api_key: 31415926, max_tokens: 4096, totalTokens: 7, flag: true });
+  assert.equal(r.password, '<REDACTED>');
+  assert.equal(r.api_key, '<REDACTED>');
+  assert.equal(r.pin, '<REDACTED>');
+  assert.equal(cli.redact({ pinned: ['a'] }).pinned[0], 'a');
+  assert.equal(r.max_tokens, 4096);
+  assert.equal(r.totalTokens, 7);
+  assert.equal(r.flag, true);
+});

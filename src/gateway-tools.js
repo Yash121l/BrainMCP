@@ -3,7 +3,7 @@
 // Console tools (gw_*) change accounts, rules, approvals and machines; they answer
 // only a human browser session, never an agent's key or connector token.
 
-import { isHumanSession, canWrite, createKey, randToken, revokeKey } from './auth.js';
+import { isHumanSession, canWrite, prepareKey, randToken, revokeKey } from './auth.js';
 import { auditInBackground } from './audit.js';
 import { userByHandle } from './tenancy.js';
 import { encryptWithKek } from './crypto.js';
@@ -714,7 +714,7 @@ async function consoleTool(R, name, args) {
 
     case 'gw_device_lookup': {
       const code = String(args.user_code || '').trim().toUpperCase();
-      const row = await env.DB.prepare("SELECT machine, agent, created, exp FROM device_codes WHERE user_code = ? AND status = 'pending' AND exp > datetime('now')").bind(code).first();
+      const row = await env.DB.prepare(`SELECT machine, agent, created, exp FROM device_codes WHERE user_code = ? AND ${OPEN_REQUEST} AND exp > datetime('now')`).bind(code).first();
       if (!row) return { error: 'that code is unknown or expired; run brain login again' };
       const known = await env.DB.prepare('SELECT tags FROM machines WHERE user_id = ? AND name = ? AND revoked = 0').bind(me, row.machine).first();
       const agents = deviceAgents(row.agent);
@@ -724,63 +724,74 @@ async function consoleTool(R, name, args) {
     case 'gw_device_approve':
     case 'gw_device_deny': {
       const code = String(args.user_code || '').trim().toUpperCase();
-      const row = await env.DB.prepare("SELECT * FROM device_codes WHERE user_code = ? AND status = 'pending' AND exp > datetime('now')").bind(code).first();
+      const row = await env.DB.prepare(`SELECT * FROM device_codes WHERE user_code = ? AND ${OPEN_REQUEST} AND exp > datetime('now')`).bind(code).first();
       if (!row) return { error: 'that code is unknown or expired; run brain login again' };
-      // Claim the request first, atomically: of two decisions at once, exactly one proceeds.
-      const claim = await env.DB.prepare("UPDATE device_codes SET status = ?, user_id = ? WHERE device_hash = ? AND status = 'pending' AND exp > datetime('now')")
-        .bind(name === 'gw_device_deny' ? 'denied' : 'approving', me, row.device_hash).run();
-      if ((claim.meta?.changes ?? 0) !== 1) return { error: 'this request was already decided a moment ago' };
+      const claimId = randToken(12);
+      const claim = (status) => env.DB.prepare(
+        `UPDATE device_codes SET status = ?, user_id = ?, claimed = datetime('now'), claim_id = ? WHERE device_hash = ? AND ${OPEN_REQUEST} AND exp > datetime('now')`
+      ).bind(status, me, claimId, row.device_hash).run();
       if (name === 'gw_device_deny') {
+        if (((await claim('denied')).meta?.changes ?? 0) !== 1) return { error: 'this request was already decided a moment ago' };
         audit('gw.device.deny', { target: row.machine });
         return { ok: true };
       }
-      const release = () => env.DB.prepare("UPDATE device_codes SET status = 'pending' WHERE device_hash = ? AND status = 'approving'").bind(row.device_hash).run();
+
+      // Every check runs before anything is written.
       const role = ['read', 'write', 'admin'].includes(args.role) ? args.role : 'write';
-      if (role === 'admin' && p.role !== 'admin' && p.role !== 'super') return (await release(), { error: 'your session cannot grant admin' });
-      if (role === 'write' && !canWrite(p)) return (await release(), { error: 'your session cannot grant write' });
-      let machine;
-      try {
-        machine = await machineFor(env, me, args.machine || row.machine, args.machine_tags);
-        if (args.machine_tags !== undefined) await env.DB.prepare('UPDATE machines SET tags = ? WHERE id = ?').bind(JSON.stringify(cleanTags(args.machine_tags)), machine.id).run();
-      } catch (e) {
-        return (await release(), { error: e.message });
-      }
+      if (role === 'admin' && p.role !== 'admin' && p.role !== 'super') return { error: 'your session cannot grant admin' };
+      if (role === 'write' && !canWrite(p)) return { error: 'your session cannot grant write' };
       let agents;
       let tags;
+      let machineTags;
       try {
         agents = (args.agent ? [args.agent] : deviceAgents(row.agent)).map(cleanAgent).filter(Boolean);
         if (!agents.length) agents = ['cli'];
         tags = cleanTags(args.agent_tags);
+        machineTags = args.machine_tags === undefined ? undefined : cleanTags(args.machine_tags);
       } catch (e) {
-        return (await release(), { error: e.message });
+        return { error: e.message };
       }
-      // A key minted here never exceeds the session that approves it: same scopes, same
-      // space limit, an admin role only for an unscoped admin session.
-      const scoped = !!p.scopes?.length;
-      const grantRole = role === 'admin' && scoped ? 'write' : role;
+      const grantRole = role === 'admin' && p.scopes?.length ? 'write' : role;
       const live = await env.DB.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))").bind(me).first();
-      if (!p.super && live.n + agents.length > LIVE_KEYS_MAX) return (await release(), { error: `this needs ${agents.length} new keys and you have ${live.n} of ${LIVE_KEYS_MAX}; revoke some first` });
-      const keys = {};
-      const ids = [];
+      if (!p.super && live.n + agents.length > LIVE_KEYS_MAX) return { error: `this needs ${agents.length} new keys and you have ${live.n} of ${LIVE_KEYS_MAX}; revoke some first` };
+      let machine;
       try {
+        machine = await machineFor(env, me, args.machine || row.machine, machineTags);
+      } catch (e) {
+        return { error: e.message };
+      }
+
+      // One claim, fenced by its own id, then one transaction: the request turns approved
+      // and the keys are inserted only if that same row now says approved under this claim
+      // and is still unexpired. Either everything lands or nothing does; no orphan keys.
+      if (((await claim('approving')).meta?.changes ?? 0) !== 1) return { error: 'this request was already decided a moment ago' };
+      try {
+        const prepared = [];
         for (const agent of agents) {
-          const created = await createKey(env, {
+          prepared.push({ agent, ...(await prepareKey(env, {
             name: `${agent} @ ${machine.name}`, role: grantRole, user_id: me, parent_key_id: p.keyId || null, machine_id: machine.id, agent, agent_tags: tags,
             prefixes: p.scopes || [], space_limit: p.spaceLimit || null, expires_at: p.expires || null,
-          });
-          keys[agent] = created.key;
-          ids.push(created.id);
+          }, { sql: "EXISTS (SELECT 1 FROM device_codes WHERE device_hash = ? AND status = 'approved' AND claim_id = ?)", binds: [row.device_hash, claimId] })) });
         }
-        const done = await env.DB.prepare("UPDATE device_codes SET status = 'approved', key_sealed = ? WHERE device_hash = ? AND status = 'approving'")
-          .bind(await encryptWithKek(env, JSON.stringify(keys)), row.device_hash).run();
-        if ((done.meta?.changes ?? 0) !== 1) throw new Error('the request changed while it was being approved');
+        const sealed = await encryptWithKek(env, JSON.stringify(Object.fromEntries(prepared.map((k) => [k.agent, k.key]))));
+        const results = await env.DB.batch([
+          env.DB.prepare("UPDATE device_codes SET status = 'approved', key_sealed = ? WHERE device_hash = ? AND status = 'approving' AND claim_id = ? AND exp > datetime('now')")
+            .bind(sealed, row.device_hash, claimId),
+          ...prepared.map((k) => k.stmt),
+          ...(machineTags !== undefined ? [env.DB.prepare('UPDATE machines SET tags = ? WHERE id = ?').bind(JSON.stringify(machineTags), machine.id)] : []),
+        ]);
+        if ((results[0].meta?.changes ?? 0) !== 1) {
+          await env.DB.prepare("UPDATE device_codes SET status = 'pending', claim_id = NULL WHERE device_hash = ? AND status = 'approving' AND claim_id = ?").bind(row.device_hash, claimId).run();
+          return { error: 'the request expired or changed while it was being approved; nothing was granted' };
+        }
+        const ids = prepared.map((k) => k.id);
+        audit('gw.device.approve', { target: machine.name, detail: { keys: ids, agents, role: grantRole } });
+        return { ok: true, machine: machine.name, agent: agents[0], agents, key_id: ids[0], key_ids: ids };
       } catch (e) {
-        for (const id of ids) await revokeKey(env, id);
-        await release();
+        await env.DB.prepare("UPDATE device_codes SET status = 'pending', claim_id = NULL WHERE device_hash = ? AND status = 'approving' AND claim_id = ?")
+          .bind(row.device_hash, claimId).run().catch(() => {});
         return { error: `approval failed, nothing was granted: ${e.message}` };
       }
-      audit('gw.device.approve', { target: machine.name, detail: { keys: ids, agents, role: grantRole } });
-      return { ok: true, machine: machine.name, agent: agents[0], agents, key_id: ids[0], key_ids: ids };
     }
 
     default:
@@ -788,6 +799,11 @@ async function consoleTool(R, name, args) {
       throw new Error(`unknown tool: ${name}`);
   }
 }
+
+// A request is open while pending, or while 'approving' under a claim older than two
+// minutes: that run died between claiming and its one-transaction grant, and nothing of
+// it landed, so another decision may take over.
+const OPEN_REQUEST = "(status = 'pending' OR (status = 'approving' AND claimed < datetime('now', '-2 minutes')))";
 
 /** The agents a device code asks for: one name, or a comma-separated list (one key each). */
 export const deviceAgents = (v) => String(v || 'cli').split(',').map((x) => x.trim()).filter(Boolean).slice(0, 8);

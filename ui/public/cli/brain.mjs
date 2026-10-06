@@ -590,12 +590,17 @@ export const PATTERNS = [
 // Key names whose values are credentials whatever they look like (an opaque password has no pattern).
 // Matched case-insensitively on the key with - _ . and spaces removed, so githubToken, X-Api-Key,
 // client_secret, refresh_token and private_key all hit; auth(?!or) skips "author".
-const SECRET_KEY_RE = /password|passwd|secret|token|apikey|authorization|auth(?!or)|cookie|session|privatekey|credential/;
+const SECRET_KEY_RE = /password|passwd|passcode|^pin$|^pincode$|secret|token|apikey|authorization|auth(?!or)|cookie|session|privatekey|credential/;
 export const isSecretKey = (k) => SECRET_KEY_RE.test(String(k).toLowerCase().replace(/[-_.\s]/g, ''));
 
+// Token counts are telemetry, not secrets: max_tokens, input_tokens, totalTokens, token_count.
+const COUNTER_KEY_RE = /^(max|min|num|total|input|output|prompt|completion|cached|used|remaining)tokens?(count|used|limit)?$|^tokens(count|used|limit)?$|^tokencount$|[a-z]tokens$/;
+const isCounterKey = (k) => COUNTER_KEY_RE.test(String(k).toLowerCase().replace(/[-_.\s]/g, ''));
+
 /**
- * Value patterns (parity with src/hook.js) plus key names: a string, array or object under a secret
- * key is replaced whole. Numbers, booleans and null are kept (max_tokens: 4096, deleteSession: true).
+ * Value patterns (parity with src/hook.js) plus key names: any value under a secret key is
+ * replaced whole, numbers included (a PIN is a number). Booleans and null are kept, and so
+ * are numeric token counters (max_tokens: 4096).
  */
 export function redact(v) {
   if (typeof v === 'string') {
@@ -604,7 +609,8 @@ export function redact(v) {
   }
   if (Array.isArray(v)) return v.map(redact);
   if (isObj(v)) {
-    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, isSecretKey(k) && (typeof x === 'string' || typeof x === 'object') && x !== null ? '<REDACTED>' : redact(x)]));
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k,
+      isSecretKey(k) && x != null && typeof x !== 'boolean' && !(typeof x === 'number' && isCounterKey(k)) ? '<REDACTED>' : redact(x)]));
   }
   return v;
 }
@@ -1197,7 +1203,9 @@ export async function runApply(opts, deps = {}) {
     let targets = rcs.filter(exists);
     if (!targets.length) targets = [path.join(h, (process.env.SHELL || '').endsWith('bash') ? '.bashrc' : '.zshrc')];
     // the block is shared: keep exports for harnesses configured by earlier runs, not only this one
-    const allAgents = [...new Set([...(manifest.shellAgents || []), ...envAgents])];
+    // Manifests written before shellAgents existed: seed from the env-based harnesses they configured.
+    const earlier = manifest.shellAgents || Object.entries(manifest.targets || {}).filter(([n]) => n !== 'claude').map(([n, t]) => t?.agent || HARNESS_AGENT[n]).filter(Boolean);
+    const allAgents = [...new Set([...earlier, ...envAgents])];
     for (const rc of targets) fx.write(rc, upsertBlock(readText(rc) ?? '', shellBlock(cmd, allAgents)));
     manifest.shell = [...new Set([...(manifest.shell || []), ...targets])];
     manifest.shellAgents = allAgents;

@@ -179,4 +179,4 @@ CREATE TABLE IF NOT EXISTS embeddings (
   PRIMARY KEY (space_id, path));
 CREATE TABLE IF NOT EXISTS device_codes (
   device_hash TEXT PRIMARY KEY, user_code TEXT UNIQUE NOT NULL, machine TEXT NOT NULL, agent TEXT,
-  status TEXT NOT NULL, key_sealed TEXT, user_id TEXT, exp TEXT NOT NULL, created TEXT);
+  status TEXT NOT NULL, key_sealed TEXT, user_id TEXT, exp TEXT NOT NULL, created TEXT, claimed TEXT, claim_id TEXT);

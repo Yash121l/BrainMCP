@@ -1051,20 +1051,24 @@ const ROLLUP_PAGE = 1000; // rows read per query
 const ROLLUP_MAX_GROUPS = 100; // R2 objects written per run; the rest wait for the next run
 
 // Keys are compared with case and separators removed (X.Api.Key, api_key, apiKey all match).
-const SECRET_KEY = /passw(or)?d|passwd|secret|token|apikey|authorization|^auth$|cookie|session|privatekey|credential/;
+const SECRET_KEY = /passw(or)?d|passwd|passcode|^pin$|^pincode$|secret|token|apikey|authorization|^auth$|cookie|session|privatekey|credential/;
 const isSecretKey = (k) => SECRET_KEY.test(String(k).toLowerCase().replace(/[^a-z0-9]/g, ''));
 
+// Token counts are telemetry, not secrets: max_tokens, input_tokens, totalTokens, token_count.
+const COUNTER_KEY = /^(max|min|num|total|input|output|prompt|completion|cached|used|remaining)tokens?(count|used|limit)?$|^tokens(count|used|limit)?$|^tokencount$|[a-z]tokens$/;
+const isCounterKey = (k) => COUNTER_KEY.test(String(k).toLowerCase().replace(/[^a-z0-9]/g, ''));
+
 /**
- * A second scrub on the server: whatever a client sent, a value under a credential-like
- * key is dropped whole (strings, objects and arrays; numbers and booleans are kept, so
- * max_tokens survives). Anything nested too deep to check is dropped too.
+ * A second scrub on the server: whatever a client sent, any value under a credential-like
+ * key is dropped whole, numbers included (a PIN is a number). Booleans, null and numeric
+ * token counters are kept. Anything nested too deep to check is dropped too.
  */
 function scrubKeys(v, depth = 0) {
   if (v == null || typeof v !== 'object') return v;
   if (depth > 12) return '[redacted: too deep]';
   if (Array.isArray(v)) return v.map((x) => scrubKeys(x, depth + 1));
   return Object.fromEntries(Object.entries(v).map(([k, x]) => [k,
-    isSecretKey(k) && x != null && typeof x !== 'number' && typeof x !== 'boolean' ? '[redacted]' : scrubKeys(x, depth + 1)]));
+    isSecretKey(k) && x != null && typeof x !== 'boolean' && !(typeof x === 'number' && isCounterKey(k)) ? '[redacted]' : scrubKeys(x, depth + 1)]));
 }
 
 /** Buffer a batch of redacted tool-call records into D1. */

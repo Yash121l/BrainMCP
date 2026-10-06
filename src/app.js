@@ -2,7 +2,7 @@
 // (see ui/) served from Workers static assets at /, so everything here is data:
 // POST /app/login mints the brain_session cookie.
 
-import { resolvePrincipal, allowed, isRootAdmin, canWrite, canWritePath, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken, roleWithoutSuper } from './auth.js';
+import { resolvePrincipal, isHumanSession, allowed, isRootAdmin, canWrite, canWritePath, createKey, listKeys, updateKey, revokeKey, isProjectSlug, sha256hex, randToken, roleWithoutSuper } from './auth.js';
 import { skillCatalog, skillsConfigEntries, renderSkillsConfig, validateSkillEntries, visibleEntries } from './skills.js';
 import { PROJECT_NOTE_PATH } from './parse.js';
 import { spacePrincipal, spaceByHandle, accessibleSpaces, allSpaces, defaultSpace } from './tenancy.js';
@@ -17,9 +17,11 @@ const superSpace = (env) => env.DB.prepare(
 
 export const sessionCookie = (req) => (req.headers.get('Cookie') || '').match(/(?:^|;\s*)brain_session=([^;]+)/)?.[1] || null;
 
+/** Only a session minted by /app/login counts: a raw key pasted into the cookie is not a session. */
 async function sessionPrincipal(req, env) {
   const tok = sessionCookie(req);
-  return tok ? resolvePrincipal(env, tok) : null;
+  const p = tok ? await resolvePrincipal(env, tok) : null;
+  return isHumanSession(p) ? p : null;
 }
 
 // ---------------------------------------------------------------- hygiene report
@@ -397,7 +399,17 @@ export async function handleApp(req, env, url, ctx, callTool = null) {
       const body = await req.json().catch(() => ({}));
       if (body.role === 'super') return Response.json({ error: 'super keys are minted over MCP with a super key' }, { status: 400 });
       try {
-        const created = await createKey(env, { name: body.name, role: body.role, prefixes: body.prefixes, expires_days: body.expires_days });
+        // A key minted here belongs to the signed-in user, descends from the session's key and
+        // never outlives it, so revoking the parent revokes it and the agent guard sees the lineage.
+        const days = body.expires_days == null || body.expires_days === '' ? null : Math.max(1, Math.min(3650, Number(body.expires_days) | 0));
+        const wanted = days ? Date.now() + days * 86400000 : null;
+        const parentEnds = principal.expires ? Date.parse(`${String(principal.expires).replace(' ', 'T')}Z`) : null;
+        const ends = parentEnds && (!wanted || parentEnds < wanted) ? parentEnds : wanted;
+        const created = await createKey(env, {
+          name: body.name, role: body.role, prefixes: body.prefixes, user_id: principal.user?.id || null,
+          parent_key_id: principal.keyId || null, space_limit: principal.spaceLimit || null,
+          expires_at: ends ? new Date(ends).toISOString().replace('T', ' ').slice(0, 19) : null,
+        });
         auditInBackground({ env, ctx, p: principal }, 'key.create', { target: created.id, detail: { role: body.role, via: 'web' } });
         return Response.json(created, { status: 201 });
       } catch (e) {

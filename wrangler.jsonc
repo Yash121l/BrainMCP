@@ -3,9 +3,8 @@
   "name": "brain-mcp",
   "main": "src/index.js",
   "compatibility_date": "2026-08-01",
-  // run_code (code mode) needs both of these and the Workers Paid plan. Uncomment
-  // together; the tool stays hidden while either is missing.
-  // "compatibility_flags": ["enable_ctx_exports"],
+  // run_code (code mode) needs the Workers Paid plan and this binding; the tool stays
+  // hidden without it. ctx.exports is on by default at this compatibility date.
   // "worker_loaders": [{ "binding": "LOADER" }],
   // Semantic memory (hybrid search) needs both of these. First:
   //   npx wrangler vectorize create brain-notes --dimensions=1024 --metric=cosine

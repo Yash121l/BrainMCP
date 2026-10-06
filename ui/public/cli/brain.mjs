@@ -57,7 +57,9 @@ function writeAtomic(p, content, mode) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const prev = (() => { try { return fs.statSync(p).mode & 0o777; } catch { return null; } })();
   const tmp = `${p}.brain-tmp-${process.pid}`;
-  fs.writeFileSync(tmp, content, { mode: mode ?? prev ?? 0o644 });
+  // 'wx' after clearing any leftover: the temp file is never a pre-planted symlink.
+  fs.rmSync(tmp, { force: true });
+  fs.writeFileSync(tmp, content, { mode: mode ?? prev ?? 0o644, flag: 'wx' });
   if (mode !== undefined) fs.chmodSync(tmp, mode);
   fs.renameSync(tmp, p);
 }
@@ -135,55 +137,140 @@ function pickStore() {
 
 const keychainArgs = () => (process.env.BRAIN_KEYCHAIN ? [process.env.BRAIN_KEYCHAIN] : []);
 
-function storeSecret(store, server, key) {
-  if (store === 'keychain') {
-    const kc = keychainArgs().join(' ');
-    if (/[\s"'\\]/.test(key + server + kc)) return false;
-    // `security -i` reads the command from stdin so the key never appears in the process list.
-    const r = spawnSync('security', ['-i'], { input: `add-generic-password -U -s ${SERVICE} -a ${server} -l BrainMCP -w ${key} ${kc}\n`, encoding: 'utf8' });
-    return r.status === 0 && !/error/i.test(r.stderr || '') && readSecret(store, server) === key;
-  }
-  if (store === 'secret-tool') {
-    const r = spawnSync('secret-tool', ['store', '--label=BrainMCP', 'service', SERVICE, 'account', server], { input: key, encoding: 'utf8' });
-    return r.status === 0;
-  }
+// One key per agent (harness): the console's per-agent rules, revocation and audit hang off it.
+export const AGENT_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
+export const HARNESS_AGENT = { claude: 'claude-code', codex: 'codex', cursor: 'cursor', gemini: 'gemini', opencode: 'opencode' };
+export const MAX_LOGIN_AGENTS = 8;
+export const envVarFor = (agent) => `BRAIN_KEY_${String(agent).toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+
+export function cleanAgent(a) {
+  const v = String(a ?? '').trim().toLowerCase();
+  if (!AGENT_RE.test(v)) fail(`agent "${a}" must be 1-40 lowercase letters, digits, dot, dash or underscore`);
+  return v;
+}
+
+/** Every agent name that may hold a key for this login (used to list and to delete). */
+export const knownAgents = (cfg) => [...new Set(['cli', ...Object.values(HARNESS_AGENT), ...(Array.isArray(cfg?.agents) ? cfg.agents : [])])].filter((a) => AGENT_RE.test(String(a)));
+
+// Keychain / secret-tool account per agent; the legacy single-key account was the bare server URL.
+const account = (server, agent) => (agent === null ? server : `${server}#${agent}`);
+
+/** File store: { server, keys: { agent: key } }. A legacy { server, key } reads as agent "cli". */
+function readFileCreds(server) {
+  const c = readJson(paths().credFile, null);
+  if (!isObj(c) || c.server !== server) return { server, keys: {}, legacy: false };
+  const keys = isObj(c.keys) ? Object.fromEntries(Object.entries(c.keys).filter(([a, k]) => AGENT_RE.test(a) && typeof k === 'string' && k)) : {};
+  const legacy = typeof c.key === 'string' && !!c.key;
+  if (legacy && !keys.cli) keys.cli = c.key;
+  return { server, keys, legacy };
+}
+
+function writeFileCreds(server, keys) {
   const p = paths();
   fs.mkdirSync(p.config, { recursive: true, mode: 0o700 });
-  writeAtomic(p.credFile, `${JSON.stringify({ server, key }, null, 2)}\n`, 0o600);
+  writeAtomic(p.credFile, `${JSON.stringify({ server, keys }, null, 2)}\n`, 0o600);
+}
+
+/** agent === null addresses the legacy single-key entry (keychain / secret-tool only). */
+function storeSecret(store, server, agent, key) {
+  const acct = account(server, agent);
+  if (store === 'keychain') {
+    const kc = keychainArgs().join(' ');
+    if (/[\s"'\\]/.test(key + acct + kc)) return false;
+    // `security -i` reads the command from stdin so the key never appears in the process list.
+    const r = spawnSync('security', ['-i'], { input: `add-generic-password -U -s ${SERVICE} -a ${acct} -l BrainMCP -w ${key} ${kc}\n`, encoding: 'utf8' });
+    return r.status === 0 && !/error/i.test(r.stderr || '') && readSecret(store, server, agent) === key;
+  }
+  if (store === 'secret-tool') {
+    const r = spawnSync('secret-tool', ['store', '--label=BrainMCP', 'service', SERVICE, 'account', acct], { input: key, encoding: 'utf8' });
+    return r.status === 0;
+  }
+  const { keys } = readFileCreds(server);
+  keys[agent ?? 'cli'] = key;
+  writeFileCreds(server, keys);
   return true;
 }
 
-function readSecret(store, server) {
+function readSecret(store, server, agent) {
+  const acct = account(server, agent);
   if (store === 'keychain') {
-    const r = spawnSync('security', ['find-generic-password', '-s', SERVICE, '-a', server, '-w', ...keychainArgs()], { encoding: 'utf8' });
+    const r = spawnSync('security', ['find-generic-password', '-s', SERVICE, '-a', acct, '-w', ...keychainArgs()], { encoding: 'utf8' });
     return r.status === 0 ? r.stdout.trim() || null : null;
   }
   if (store === 'secret-tool') {
-    const r = spawnSync('secret-tool', ['lookup', 'service', SERVICE, 'account', server], { encoding: 'utf8' });
+    const r = spawnSync('secret-tool', ['lookup', 'service', SERVICE, 'account', acct], { encoding: 'utf8' });
     return r.status === 0 ? r.stdout.trim() || null : null;
   }
-  const c = readJson(paths().credFile, null);
-  return c && c.server === server ? c.key || null : null;
+  return readFileCreds(server).keys[agent ?? 'cli'] || null;
 }
 
-function deleteSecret(store, server) {
-  if (store === 'keychain') spawnSync('security', ['delete-generic-password', '-s', SERVICE, '-a', server, ...keychainArgs()], { encoding: 'utf8' });
-  else if (store === 'secret-tool') spawnSync('secret-tool', ['clear', 'service', SERVICE, 'account', server], { encoding: 'utf8' });
+function deleteSecret(store, server, agent) {
+  const acct = account(server, agent);
+  if (store === 'keychain') spawnSync('security', ['delete-generic-password', '-s', SERVICE, '-a', acct, ...keychainArgs()], { encoding: 'utf8' });
+  else if (store === 'secret-tool') spawnSync('secret-tool', ['clear', 'service', SERVICE, 'account', acct], { encoding: 'utf8' });
+}
+
+/** Remove every key (all agents plus the legacy entry) this login may have stored. */
+function deleteAllSecrets(store, server, agents) {
+  if (store === 'keychain' || store === 'secret-tool') for (const a of [null, ...agents]) deleteSecret(store, server, a);
   fs.rmSync(paths().credFile, { force: true });
 }
 
-/** Stored login first; BRAIN_KEY (+ BRAIN_URL) from the environment as a fallback for headless boxes. */
-export function loadCreds({ required = true } = {}) {
-  const cfg = loadConfig();
+/**
+ * Config written before per-agent keys has no `agents` list and one key (keychain account = server,
+ * or credentials.json { server, key }). Move that key to agent "cli" once.
+ */
+export function migrateLegacy(cfg) {
+  if (!isObj(cfg) || !cfg.server || Array.isArray(cfg.agents)) return cfg;
+  const store = cfg.store || 'file';
+  let key = null;
+  if (store === 'file') {
+    const c = readFileCreds(cfg.server);
+    if (c.legacy) key = c.keys.cli;
+  } else key = readSecret(store, cfg.server, null);
+  const { agent: _legacyAgent, ...rest } = cfg;
+  const next = { ...rest, agents: key ? ['cli'] : [] };
+  if (key) {
+    if (!storeSecret(store, cfg.server, 'cli', key)) return cfg;
+    if (store !== 'file') deleteSecret(store, cfg.server, null);
+  }
+  try { saveConfig(next); } catch { /* read-only config: migrate again next time */ }
+  return next;
+}
+
+/**
+ * The stored key for one agent ("cli" by default). BRAIN_KEY_<AGENT> from the environment is a fallback;
+ * plain BRAIN_KEY (+ BRAIN_URL) only counts on a headless box with no stored login, so one agent never
+ * silently runs on another agent's key. `fallbackCli` is for telemetry only.
+ */
+export function loadCreds({ agent = 'cli', required = true, fallbackCli = false } = {}) {
+  const a = cleanAgent(agent);
+  const cfg = migrateLegacy(loadConfig());
+  const store = cfg?.store || 'file';
   if (cfg?.server) {
-    const key = readSecret(cfg.store || 'file', cfg.server);
-    if (key) return { ...cfg, key };
+    let key = readSecret(store, cfg.server, a);
+    let used = a;
+    if (!key && fallbackCli && a !== 'cli') { key = readSecret(store, cfg.server, 'cli'); used = 'cli'; }
+    if (key) return { ...cfg, key, agent: used };
   }
-  if (process.env.BRAIN_KEY) {
-    return { server: normalizeServer(process.env.BRAIN_URL || cfg?.server || DEFAULT_SERVER), key: process.env.BRAIN_KEY, machine: cfg?.machine || null, agent: cfg?.agent || null, store: 'env' };
+  const envKey = process.env[envVarFor(a)] || (!cfg?.server ? process.env.BRAIN_KEY : '');
+  if (envKey) {
+    return { server: normalizeServer(process.env.BRAIN_URL || cfg?.server || DEFAULT_SERVER), key: envKey, machine: cfg?.machine || null, agent: a, agents: cfg?.agents || [], store: 'env' };
   }
-  if (required) fail(cfg?.server ? `no key found in the ${cfg.store || 'file'} store; run \`brain login\` again` : 'not logged in; run `brain login`');
+  if (required) fail(cfg?.server ? `no key for agent "${a}" in the ${store} store; run \`brain login --agents ${a}\`` : 'not logged in; run `brain login`');
   return null;
+}
+
+/** Credentials for requests that belong to the machine rather than one harness: "cli" first, else any agent's. */
+function machineCreds() {
+  const cli = loadCreds({ required: false });
+  if (cli) return cli;
+  const cfg = loadConfig();
+  for (const a of knownAgents(cfg)) {
+    const c = loadCreds({ agent: a, required: false });
+    if (c) return c;
+  }
+  return loadCreds();
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -251,7 +338,7 @@ export function removeBlock(text) {
 export const hasBlock = (text) => START_RE.test(text || '');
 
 export function codexBlock(server) {
-  return `[mcp_servers.brain]\nurl = ${JSON.stringify(`${server}/mcp`)}\nbearer_token_env_var = "BRAIN_KEY"`;
+  return `[mcp_servers.brain]\nurl = ${JSON.stringify(`${server}/mcp`)}\nbearer_token_env_var = "${envVarFor(HARNESS_AGENT.codex)}"`;
 }
 
 export function upsertCodexConfig(text, server) {
@@ -261,8 +348,9 @@ export function upsertCodexConfig(text, server) {
   return upsertBlock(text, codexBlock(server));
 }
 
-export function shellBlock(cmd) {
-  return `export BRAIN_KEY="$(${cmd} auth token 2>/dev/null)"`;
+/** One export per agent that reads its key from the environment (Codex, Cursor, Gemini, OpenCode). */
+export function shellBlock(cmd, agents) {
+  return agents.map((a) => `export ${envVarFor(a)}="$(${cmd} auth token --agent ${a} 2>/dev/null)"`).join('\n');
 }
 
 // ------------------------------------------------------------------ JSON configs
@@ -270,12 +358,12 @@ export function shellBlock(cmd) {
 export function harnessJsonTargets(server) {
   const url = `${server}/mcp`;
   return {
-    cursor: { file: ['.cursor', 'mcp.json'], key: ['mcpServers', 'brain'], value: { url, headers: { Authorization: 'Bearer ${env:BRAIN_KEY}' } } },
-    gemini: { file: ['.gemini', 'settings.json'], key: ['mcpServers', 'brain'], value: { httpUrl: url, headers: { Authorization: 'Bearer $BRAIN_KEY' } } },
+    cursor: { file: ['.cursor', 'mcp.json'], key: ['mcpServers', 'brain'], value: { url, headers: { Authorization: `Bearer \${env:${envVarFor(HARNESS_AGENT.cursor)}}` } } },
+    gemini: { file: ['.gemini', 'settings.json'], key: ['mcpServers', 'brain'], value: { httpUrl: url, headers: { Authorization: `Bearer $${envVarFor(HARNESS_AGENT.gemini)}` } } },
     opencode: {
       file: ['.config', 'opencode', 'opencode.json'],
       key: ['mcp', 'brain'],
-      value: { type: 'remote', url, headers: { Authorization: 'Bearer {env:BRAIN_KEY}' }, enabled: true },
+      value: { type: 'remote', url, headers: { Authorization: `Bearer {env:${envVarFor(HARNESS_AGENT.opencode)}}` }, enabled: true },
       init: { $schema: 'https://opencode.ai/config.json' },
     },
   };
@@ -321,7 +409,7 @@ export const getJsonKey = (obj, keys) => keys.reduce((o, k) => (isObj(o) ? o[k] 
 
 export const isBrainHookCommand = (cmd) => {
   const c = String(cmd || '').trim();
-  return (c.includes('brain') && c.endsWith('hook post-tool')) || c.includes('brain-telemetry.sh');
+  return (c.includes('brain') && /\shook post-tool(?:\s+--agent[= ]\S+)?$/.test(c)) || c.includes('brain-telemetry.sh');
 };
 
 export function withoutClaudeHook(settings) {
@@ -388,33 +476,90 @@ export function planSkills(bundle, prev = {}, dirExists = () => false, { adopt =
   return { write, remove, skipped, unsafe, managed };
 }
 
+const lstatOr = (p) => { try { return fs.lstatSync(p); } catch { return null; } };
+const isLink = (p) => !!lstatOr(p)?.isSymbolicLink();
+const inside = (root, p) => p === root || p.startsWith(root + path.sep);
+
+/**
+ * Resolve a manifest/bundle path under a skills base without following symlinks: every directory
+ * from the base down to the file's parent must be a real directory (lstat), and the resolved parent
+ * must stay inside the base. With `create`, missing directories are made one level at a time.
+ * Returns { file, stat } (stat is the lstat of the file or null), { missing: true }, or { error }.
+ */
+export function skillTarget(base, rel, { create = false } = {}) {
+  const segs = safeSkillPath(rel);
+  if (!segs) return { error: 'unsafe path' };
+  const b = lstatOr(base);
+  if (b && (b.isSymbolicLink() || !b.isDirectory())) return { error: `${base} is not a real directory` };
+  if (!b) {
+    if (!create) return { missing: true };
+    fs.mkdirSync(base, { recursive: true });
+  }
+  let dir = base;
+  for (const seg of segs.slice(0, -1)) {
+    dir = path.join(dir, seg);
+    const st = lstatOr(dir);
+    if (!st) {
+      if (!create) return { missing: true };
+      fs.mkdirSync(dir);
+      continue;
+    }
+    if (st.isSymbolicLink()) return { error: `${path.relative(base, dir)} is a symlink` };
+    if (!st.isDirectory()) return { error: `${path.relative(base, dir)} is not a directory` };
+  }
+  const file = path.join(base, ...segs);
+  try {
+    if (!inside(fs.realpathSync(base), fs.realpathSync(path.dirname(file)))) return { error: 'resolves outside the skills folder' };
+  } catch { return { missing: true }; }
+  return { file, stat: lstatOr(file) };
+}
+
 function pruneEmptyDirs(base, rel) {
   let dir = path.dirname(path.join(base, rel));
   while (dir.startsWith(base + path.sep) && dir !== base) {
+    const st = lstatOr(dir);
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return;
     try { fs.rmdirSync(dir); } catch { return; }
     dir = path.dirname(dir);
   }
 }
 
-const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
-
 export function applySkills(base, bundle, prev, fx, opts = {}) {
   if (isLink(base)) fail(`${base} is a symlink; refusing to write skills through it`);
-  const plan = planSkills(bundle, prev, (name) => exists(path.join(base, name)) || isLink(path.join(base, name)), opts);
+  const plan = planSkills(bundle, prev, (name) => !!lstatOr(path.join(base, name)), opts);
   const linked = new Set(Object.keys(plan.managed).filter((n) => isLink(path.join(base, n))));
   for (const n of linked) { delete plan.managed[n]; plan.skipped.push(n); }
+  const refused = [];
+  const notWritten = new Set();
   let wrote = 0;
   for (const f of plan.write) {
     if (linked.has(f.rel.split('/')[0])) continue;
-    const dest = path.join(base, ...f.rel.split('/'));
-    if (fx.write(dest, f.content, { backup: false, mode: f.rel.endsWith('.sh') ? 0o755 : undefined })) wrote++;
+    const t = skillTarget(base, f.rel, { create: !fx.dryRun });
+    if (t.missing && fx.dryRun) { if (fx.write(path.join(base, ...f.rel.split('/')), f.content, { backup: false })) wrote++; continue; }
+    if (t.error || t.missing) { refused.push(`${f.rel} (${t.error || 'parent missing'})`); notWritten.add(f.rel); continue; }
+    if (t.stat?.isSymbolicLink()) {
+      // Replace the link itself; never write through it.
+      if (fx.dryRun) fx.log(`  would replace symlink ${t.file}`);
+      else fs.unlinkSync(t.file);
+    } else if (t.stat && !t.stat.isFile()) { refused.push(`${f.rel} (not a regular file)`); notWritten.add(f.rel); continue; }
+    if (fx.write(t.file, f.content, { backup: false, mode: f.rel.endsWith('.sh') ? 0o755 : undefined })) wrote++;
+  }
+  for (const [name, rels] of Object.entries(plan.managed)) {
+    const kept = rels.filter((r) => !notWritten.has(r));
+    if (kept.length) plan.managed[name] = kept;
+    else delete plan.managed[name];
   }
   let removed = 0;
   for (const rel of plan.remove) {
-    if (fx.remove(path.join(base, ...rel.split('/')))) removed++;
+    const t = skillTarget(base, rel);
+    if (t.missing) continue;
+    if (t.error) { refused.push(`${rel} (${t.error})`); continue; }
+    if (!t.stat) continue;
+    if (t.stat.isSymbolicLink() || !t.stat.isFile()) { refused.push(`${rel} (${t.stat.isSymbolicLink() ? 'is a symlink' : 'not a regular file'})`); continue; }
+    if (fx.remove(t.file)) removed++;
     if (!fx.dryRun) pruneEmptyDirs(base, rel);
   }
-  return { ...plan, wrote, removed };
+  return { ...plan, wrote, removed, refused };
 }
 
 // ------------------------------------------------------------------ telemetry hook (parity with src/hook.js)
@@ -442,13 +587,25 @@ export const PATTERNS = [
   [re(`${B0}[0-9a-fA-F]{48,}${B1}`), '<REDACTED>'],
 ];
 
+// Key names whose values are credentials whatever they look like (an opaque password has no pattern).
+// Matched case-insensitively on the key with - _ . and spaces removed, so githubToken, X-Api-Key,
+// client_secret, refresh_token and private_key all hit; auth(?!or) skips "author".
+const SECRET_KEY_RE = /password|passwd|secret|token|apikey|authorization|auth(?!or)|cookie|session|privatekey|credential/;
+export const isSecretKey = (k) => SECRET_KEY_RE.test(String(k).toLowerCase().replace(/[-_.\s]/g, ''));
+
+/**
+ * Value patterns (parity with src/hook.js) plus key names: a string, array or object under a secret
+ * key is replaced whole. Numbers, booleans and null are kept (max_tokens: 4096, deleteSession: true).
+ */
 export function redact(v) {
   if (typeof v === 'string') {
     for (const [pat, rep] of PATTERNS) v = v.replace(pat, rep);
     return v;
   }
   if (Array.isArray(v)) return v.map(redact);
-  if (isObj(v)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redact(x)]));
+  if (isObj(v)) {
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, isSecretKey(k) && (typeof x === 'string' || typeof x === 'object') && x !== null ? '<REDACTED>' : redact(x)]));
+  }
   return v;
 }
 
@@ -640,23 +797,36 @@ async function readStdin(limitMs = 3000) {
   });
 }
 
+/** The agent a hook runs for (--agent, else BRAIN_AGENT, else "cli"); anything malformed means "cli". */
+export function hookAgent(opts = {}) {
+  const a = String(opts.agent || process.env.BRAIN_AGENT || 'cli').trim().toLowerCase();
+  return AGENT_RE.test(a) ? a : 'cli';
+}
+
+/** Each agent spools separately so a flush sends its records with that agent's own key. */
+export const spoolDir = (agent) => path.join(paths().spool, agent);
+
 async function cmdHook(sub, opts) {
   try {
+    const agent = hookAgent(opts);
     if (sub === 'flush') {
-      const creds = loadCreds({ required: false });
-      if (creds) await flushSpool(creds);
+      const creds = loadCreds({ agent, required: false, fallbackCli: true });
+      if (!creds) return;
+      await flushSpool(creds, spoolDir(agent));
+      // Records spooled before per-agent keys sit in the spool root; they were sent as "cli" then too.
+      if (agent === 'cli') await flushSpool(creds, paths().spool);
       return;
     }
     if (sub !== 'post-tool') return;
     const input = await readStdin();
-    if (!input.trim() || (!loadConfig()?.server && !process.env.BRAIN_KEY)) return;
+    if (!input.trim() || (!loadConfig()?.server && !process.env.BRAIN_KEY && !process.env[envVarFor(agent)])) return;
     let data;
     try { data = JSON.parse(input); } catch { return; }
     const surface = opts.surface || process.env.BRAIN_SURFACE || (data?.hook_event_name?.startsWith?.('after') ? 'cursor' : 'claude-code');
     const rec = buildRecord(data, { surface, fallbackCwd: process.cwd() });
     if (!rec) return;
-    if (spoolRecord(rec)) {
-      const child = spawn(process.execPath, [SELF, 'hook', 'flush'], { detached: true, stdio: 'ignore', env: process.env });
+    if (spoolRecord(rec, spoolDir(agent))) {
+      const child = spawn(process.execPath, [SELF, 'hook', 'flush', '--agent', agent], { detached: true, stdio: 'ignore', env: process.env });
       child.on('error', () => {});
       child.unref();
     }
@@ -942,7 +1112,9 @@ export async function runApply(opts, deps = {}) {
   const fx = deps.fx || makeFx({ dryRun: !!opts['dry-run'] });
   const log = fx.log;
   const h = deps.home || home();
-  const creds = deps.creds || loadCreds();
+  const creds = deps.creds || machineCreds();
+  // Each harness runs on its own key; a harness without one is still configured but reported, never given another agent's key.
+  const hasKey = deps.hasKey || ((agent) => (isObj(creds.keys) ? !!creds.keys[agent] : !!loadCreds({ agent, required: false })));
   const whichFn = deps.which || which;
   const cmd = deps.selfCommand || selfCommand(whichFn);
   const manifest = deps.manifest || loadManifest();
@@ -952,6 +1124,7 @@ export async function runApply(opts, deps = {}) {
   if (!found.length) { log(only ? `None of ${only.join(', ')} is installed here.` : 'No supported harness found (claude, codex, cursor, gemini, opencode).'); }
   const jsonTargets = harnessJsonTargets(creds.server);
   const report = {};
+  const missing = [];
   manifest.server = creds.server;
   manifest.targets ||= {};
   manifest.skills ||= {};
@@ -971,6 +1144,7 @@ export async function runApply(opts, deps = {}) {
     if (Object.keys(r.managed).length) manifest.skills[base] = r.managed;
     else delete manifest.skills[base];
     const bits = [`${Object.keys(r.managed).length} skills (${r.wrote} files written, ${r.removed} removed)`];
+    if (r.refused.length) bits.push(`refused ${r.refused.length} path(s) that go through a symlink or are not plain files: ${r.refused.join(', ')}`);
     if (r.skipped.length) bits.push(`skipped existing unmanaged: ${r.skipped.join(', ')} (rerun with --adopt to manage them)`);
     if (r.unsafe.length) bits.push(`rejected ${r.unsafe.length} unsafe path(s)`);
     return bits.join('; ');
@@ -979,17 +1153,18 @@ export async function runApply(opts, deps = {}) {
   for (const name of found) {
     log(`${name}:`);
     const done = [];
+    const agent = HARNESS_AGENT[name];
     try {
       if (name === 'claude') {
         if (whichFn('claude')) {
-          const spec = JSON.stringify({ type: 'http', url: `${creds.server}/mcp`, headersHelper: `${cmd} auth header` });
+          const spec = JSON.stringify({ type: 'http', url: `${creds.server}/mcp`, headersHelper: `${cmd} auth header --agent ${agent}` });
           fx.run('claude', ['mcp', 'remove', '-s', 'user', 'brain'], { quietFail: true });
           const r = fx.run('claude', ['mcp', 'add-json', '-s', 'user', 'brain', spec]);
           if (r.status !== 0) fail(`claude mcp add-json failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
           done.push('MCP server registered (user scope)');
         } else done.push('`claude` not on PATH, MCP server not registered (rerun after installing Claude Code)');
         const file = path.join(h, '.claude', 'settings.json');
-        fx.write(file, jsonText(withClaudeHook(readJson(file, {}), `${cmd} hook post-tool`)));
+        fx.write(file, jsonText(withClaudeHook(readJson(file, {}), `${cmd} hook post-tool --agent ${agent}`)));
         done.push('PostToolUse telemetry hook set');
         done.push(syncSkills(path.join(h, '.claude', 'skills')));
       } else if (name === 'codex') {
@@ -1002,7 +1177,12 @@ export async function runApply(opts, deps = {}) {
         configureJson(path.join(h, ...t.file), t, fx);
         done.push(`MCP server set in ${path.join('~', ...t.file)}`);
       }
-      manifest.targets[name] = { at: new Date().toISOString() };
+      manifest.targets[name] = { at: new Date().toISOString(), agent };
+      if (hasKey(agent)) done.push(`identity: agent "${agent}" (its own key)`);
+      else {
+        missing.push(agent);
+        done.push(`no key for agent "${agent}" yet; it cannot connect until you run \`brain login --agents ${agent}\``);
+      }
     } catch (e) {
       if (!(e instanceof CliError)) throw e;
       done.push(`FAILED: ${e.message}`);
@@ -1011,15 +1191,22 @@ export async function runApply(opts, deps = {}) {
     report[name] = done;
   }
 
-  if (opts.shell) {
+  const envAgents = found.filter((n) => n !== 'claude').map((n) => HARNESS_AGENT[n]);
+  if (opts.shell && envAgents.length) {
     const rcs = ['.zshrc', '.bashrc'].map((f) => path.join(h, f));
     let targets = rcs.filter(exists);
     if (!targets.length) targets = [path.join(h, (process.env.SHELL || '').endsWith('bash') ? '.bashrc' : '.zshrc')];
-    for (const rc of targets) fx.write(rc, upsertBlock(readText(rc) ?? '', shellBlock(cmd)));
+    for (const rc of targets) fx.write(rc, upsertBlock(readText(rc) ?? '', shellBlock(cmd, envAgents)));
     manifest.shell = [...new Set([...(manifest.shell || []), ...targets])];
-    log(`shell: BRAIN_KEY exported from ${targets.map((t) => path.basename(t)).join(', ')} (open a new shell)`);
-  } else if (found.some((n) => n !== 'claude')) {
-    log('note: Codex, Cursor, Gemini and OpenCode read BRAIN_KEY from the environment; run `brain apply --shell` or export BRAIN_KEY="$(brain auth token)".');
+    log(`shell: ${envAgents.map(envVarFor).join(', ')} exported from ${targets.map((t) => path.basename(t)).join(', ')} (open a new shell)`);
+  } else if (opts.shell) {
+    log('shell: no configured agent reads its key from the environment; nothing to export');
+  } else if (envAgents.length) {
+    log(`note: ${envAgents.join(', ')} read their own key from ${envAgents.map(envVarFor).join(', ')}; run \`brain apply --shell\` or e.g. export ${envVarFor(envAgents[0])}="$(brain auth token --agent ${envAgents[0]})".`);
+  }
+  if (missing.length) {
+    report.missing = missing;
+    log(`missing keys: ${missing.join(', ')}. Run \`brain login --agents ${missing.join(',')}\` (one approval mints one key per agent).`);
   }
   if (report.skills) log(report.skills);
   if (!fx.dryRun) writeAtomic(paths(h).manifest, jsonText(manifest), 0o600);
@@ -1066,8 +1253,14 @@ export async function runUninstall(deps = {}) {
   }
 
   for (const [base, skills] of Object.entries(manifest.skills || {})) {
-    const r = applySkills(base, { files: [] }, skills, fx);
-    if (r.removed) note(`skills: ${Object.keys(skills).length} removed from ${base}`);
+    try {
+      const r = applySkills(base, { files: [] }, skills, fx);
+      if (r.removed) note(`skills: ${Object.keys(skills).length} removed from ${base}`);
+      if (r.refused.length) note(`skills: left ${r.refused.length} path(s) in ${base} alone (symlinked or not plain files): ${r.refused.join(', ')}`);
+    } catch (e) {
+      if (!(e instanceof CliError)) throw e;
+      note(`skills: ${e.message}`);
+    }
   }
 
   if (!fx.dryRun) {
@@ -1079,23 +1272,42 @@ export async function runUninstall(deps = {}) {
 
 // ------------------------------------------------------------------ commands
 
+/** Which agents a login asks keys for: --agents a,b, or --agent x, else "cli" plus every detected harness. */
+export function loginAgents(opts = {}, h = home(), whichFn = which) {
+  let list;
+  if (opts.agents !== undefined) list = String(opts.agents).split(',');
+  else if (opts.agent !== undefined) list = [String(opts.agent)];
+  else list = ['cli', ...detectHarnesses(h, whichFn).map((n) => HARNESS_AGENT[n])];
+  list = [...new Set(list.map((x) => x.trim()).filter(Boolean).map(cleanAgent))];
+  if (!list.length) fail('--agents needs at least one agent name');
+  if (list.length > MAX_LOGIN_AGENTS) fail(`one login can ask for at most ${MAX_LOGIN_AGENTS} agents (got ${list.length}); split them over two \`brain login --agents\` runs`);
+  return list;
+}
+
+/** The {agent: key} map from a /device/token reply; an older server sends only { key, agent }. */
+export function issuedKeys(got, asked) {
+  const raw = isObj(got?.keys) && Object.keys(got.keys).length ? got.keys : { [got?.agent || asked[0]]: got?.key };
+  return Object.fromEntries(Object.entries(raw).filter(([a, k]) => AGENT_RE.test(a) && typeof k === 'string' && k));
+}
+
 async function cmdLogin(opts) {
   const server = normalizeServer(opts.server || process.env.BRAIN_URL || loadConfig()?.server || DEFAULT_SERVER);
   const machine = defaultMachine(opts.machine || os.hostname());
-  const agent = String(opts.agent || 'cli').toLowerCase().slice(0, 40);
-  const start = await api(server, '/device/code', { method: 'POST', body: { machine, agent } });
+  const agents = loginAgents(opts);
+  const start = await api(server, '/device/code', { method: 'POST', body: { machine, agents } });
   if (start.ok && !start.json) fail(`${server} did not answer like a BrainMCP server (HTTP ${start.status}, not JSON); check --server`);
   if (!start.ok || !start.json?.device_code) fail(`login could not start: ${start.json?.error_description || start.json?.error || `HTTP ${start.status}`}`);
   const { device_code: deviceCode, user_code: code, expires_in: expiresIn = 900 } = start.json;
   let interval = Math.max(1, Number(start.json.interval) || 5);
   out(`To approve this machine (${machine}), open:\n\n  ${server}/#device?code=${code}\n\nand confirm the code  ${code}\n`);
+  out(`One approval mints one key per agent: ${agents.join(', ')}.`);
   out('Waiting for approval...');
   const deadline = Date.now() + expiresIn * 1000;
   let got = null;
   while (Date.now() < deadline) {
     await sleep(interval * 1000);
     const r = await api(server, '/device/token', { method: 'POST', body: { device_code: deviceCode } }).catch((e) => ({ json: { error: 'network' }, status: 0, msg: e.message }));
-    if (r.ok && r.json?.key) { got = r.json; break; }
+    if (r.ok && (r.json?.key || isObj(r.json?.keys))) { got = r.json; break; }
     const e = r.json?.error;
     if (e === 'authorization_pending' || e === 'network') continue;
     if (e === 'slow_down' || r.status === 429) { interval += 5; continue; }
@@ -1104,25 +1316,43 @@ async function cmdLogin(opts) {
     fail(`login failed: ${e || `HTTP ${r.status}`}`);
   }
   if (!got) fail('the code expired; run `brain login` again');
-  const old = loadConfig();
-  if (old?.server) deleteSecret(old.store || 'file', old.server);
-  let store = pickStore();
-  if (!storeSecret(store, server, got.key)) {
-    err(`could not save the key to the ${store}; using ${paths().credFile} (mode 600) instead`);
-    store = 'file';
-    storeSecret(store, server, got.key);
+  const keys = issuedKeys(got, agents);
+  if (!Object.keys(keys).length) fail('the server approved the login but sent no key');
+
+  // Keep this server's keys for agents not in this login; drop everything if the server changed.
+  const old = migrateLegacy(loadConfig());
+  const kept = {};
+  if (old?.server === server) {
+    for (const a of knownAgents(old)) {
+      if (keys[a]) continue;
+      const k = readSecret(old.store || 'file', server, a);
+      if (k) kept[a] = k;
+    }
   }
-  saveConfig({ server, machine: got.machine || machine, agent: got.agent || agent, store });
-  out(`Logged in as machine "${got.machine || machine}" on ${server} (key stored in ${store === 'file' ? paths().credFile : store}).`);
+  if (old?.server) deleteAllSecrets(old.store || 'file', old.server, knownAgents(old));
+  const all = { ...kept, ...keys };
+  let store = pickStore();
+  const put = (st) => Object.entries(all).every(([a, k]) => storeSecret(st, server, a, k));
+  if (!put(store)) {
+    err(`could not save the keys to the ${store}; using ${paths().credFile} (mode 600) instead`);
+    if (store !== 'file') deleteAllSecrets(store, server, Object.keys(all));
+    store = 'file';
+    put(store);
+  }
+  saveConfig({ server, machine: got.machine || machine, agents: Object.keys(all), store });
+  out(`Logged in as machine "${got.machine || machine}" on ${server} (keys stored in ${store === 'file' ? paths().credFile : store}).`);
+  out(`Keys: ${Object.keys(keys).join(', ')}${Object.keys(kept).length ? ` (kept from before: ${Object.keys(kept).join(', ')})` : ''}.`);
+  const notIssued = agents.filter((a) => !keys[a]);
+  if (notIssued.length) err(`the server issued no key for: ${notIssued.join(', ')} (it may not support one key per agent yet); \`brain apply\` will report them as missing`);
   out('Next: `brain apply` to wire up your coding agents.');
 }
 
 function cmdLogout() {
-  const cfg = loadConfig();
+  const cfg = migrateLegacy(loadConfig());
   if (!cfg?.server) { out('Not logged in.'); return; }
-  deleteSecret(cfg.store || 'file', cfg.server);
+  deleteAllSecrets(cfg.store || 'file', cfg.server, knownAgents(cfg));
   fs.rmSync(paths().configFile, { force: true });
-  out(`Logged out of ${cfg.server}. The key still exists on the server; revoke it in the console (${cfg.server}/#keys) if this machine is gone for good.`);
+  out(`Logged out of ${cfg.server}. The keys still exist on the server; revoke them in the console (${cfg.server}/#keys) if this machine is gone for good.`);
 }
 
 async function cmdWhoami() {
@@ -1131,26 +1361,32 @@ async function cmdWhoami() {
   try { out(JSON.stringify(JSON.parse(text), null, 2)); } catch { out(text); }
 }
 
+/** [agent, stored?] for every agent this login knows about or that a detected harness needs. */
+function agentKeyStatus(cfg) {
+  const wanted = [...new Set([...knownAgents(cfg).filter((a) => a === 'cli' || (cfg?.agents || []).includes(a)), ...detectHarnesses().map((n) => HARNESS_AGENT[n])])];
+  return wanted.map((a) => [a, loadCreds({ agent: a, required: false })]);
+}
+
 function cmdStatus() {
-  const cfg = loadConfig();
-  const creds = loadCreds({ required: false });
+  const cfg = migrateLegacy(loadConfig());
   const m = loadManifest();
-  out(`server:      ${creds?.server || cfg?.server || '(not logged in)'}`);
-  out(`machine:     ${cfg?.machine || '-'}  agent: ${cfg?.agent || '-'}`);
-  out(`credentials: ${creds ? `stored (${creds.store})` : 'none'}`);
+  out(`server:      ${cfg?.server || process.env.BRAIN_URL || '(not logged in)'}`);
+  out(`machine:     ${cfg?.machine || '-'}`);
+  for (const [a, c] of agentKeyStatus(cfg)) out(`key:         ${a.padEnd(12)} ${c ? `stored (${c.store})` : 'missing (brain login --agents ' + a + ')'}`);
   out(`configured:  ${Object.keys(m.targets || {}).join(', ') || 'nothing yet (run `brain apply`)'}`);
   for (const [base, skills] of Object.entries(m.skills || {})) out(`skills:      ${Object.keys(skills).length} in ${base}`);
   if (m.shell?.length) out(`shell:       ${m.shell.join(', ')}`);
   const spool = paths().spool;
-  const pending = isDir(spool) ? fs.readdirSync(spool).filter((f) => /\.(jsonl|batch)$/.test(f)).length : 0;
+  const count = (d) => (isDir(d) ? fs.readdirSync(d).filter((f) => /\.(jsonl|batch)$/.test(f)).length : 0);
+  const pending = count(spool) + (isDir(spool) ? fs.readdirSync(spool).filter((f) => AGENT_RE.test(f) && isDir(path.join(spool, f))).reduce((n, f) => n + count(path.join(spool, f)), 0) : 0);
   out(`telemetry:   ${pending} spool file(s) waiting`);
 }
 
-function cmdAuth(sub) {
-  const creds = loadCreds();
+function cmdAuth(sub, opts = {}) {
+  if (sub !== 'header' && sub !== 'token') fail('usage: brain auth header|token [--agent NAME]');
+  const creds = loadCreds({ agent: opts.agent || 'cli' });
   if (sub === 'header') out(JSON.stringify({ Authorization: `Bearer ${creds.key}` }));
-  else if (sub === 'token') out(creds.key);
-  else fail('usage: brain auth header|token');
+  else out(creds.key);
 }
 
 async function cmdDoctor() {
@@ -1158,8 +1394,11 @@ async function cmdDoctor() {
   const line = (ok, label, detail = '') => { if (ok === false) bad++; out(`${ok === true ? ' ok ' : ok === false ? 'FAIL' : 'warn'}  ${label}${detail ? `: ${detail}` : ''}`); };
   const major = Number(process.versions.node.split('.')[0]);
   line(major >= 20, 'node', `${process.versions.node}${major < 22 ? ' (brain bridge needs 22+)' : ''}`);
+  const cfg = migrateLegacy(loadConfig());
   const creds = loadCreds({ required: false });
-  line(!!creds, 'credentials', creds ? `${creds.store} for ${creds.server}` : 'run `brain login`');
+  line(!!creds, 'credentials', creds ? `${creds.store} for ${creds.server}` : cfg?.server ? 'no "cli" key; run `brain login --agents cli`' : 'run `brain login`');
+  const keyStatus = agentKeyStatus(cfg);
+  for (const [a, c] of keyStatus) line(c ? true : a === 'cli' ? false : null, `key ${a}`, c ? `stored (${c.store})` : `missing; run \`brain login --agents ${a}\``);
   if (creds) {
     try {
       const r = await api(creds.server, '/health', { timeout: 10000 });
@@ -1182,8 +1421,14 @@ async function cmdDoctor() {
     } catch { ok = false; }
     line(ok ? true : null, n, ok ? 'configured' : 'not configured (run `brain apply`)');
   }
-  const envKey = process.env.BRAIN_KEY;
-  line(envKey ? (creds && envKey !== creds.key ? null : true) : null, 'BRAIN_KEY env', envKey ? (creds && envKey !== creds.key ? 'set but differs from the stored key (open a new shell)' : 'set') : 'not set (Codex/Cursor/Gemini/OpenCode need it; `brain apply --shell`)');
+  for (const [a, c] of keyStatus) {
+    if (a === 'cli' || a === HARNESS_AGENT.claude) continue;
+    const v = envVarFor(a);
+    const envKey = process.env[v];
+    if (!envKey) line(null, `${v} env`, `not set (${a} reads its key from it; \`brain apply --shell\`)`);
+    else if (c && c.store !== 'env' && envKey !== c.key) line(null, `${v} env`, 'set but differs from the stored key (open a new shell)');
+    else line(true, `${v} env`, 'set');
+  }
   if (bad) process.exitCode = 1;
 }
 
@@ -1198,20 +1443,26 @@ const HELP = `brain ${VERSION}: connect this machine's coding agents to BrainMCP
 
 Usage: brain <command> [options]
 
-  login [--server URL] [--machine NAME] [--agent NAME]
-                       approve this machine in the browser and store its key
-  logout               forget the stored key
+  login [--server URL] [--machine NAME] [--agents a,b | --agent NAME]
+                       approve this machine once in the browser; it gets one key per
+                       agent (cli plus every installed harness: claude-code, codex,
+                       cursor, gemini, opencode), so the console can set rules for,
+                       audit and revoke each one separately
+  logout               forget every stored key
   whoami               show the account behind the key
   status               show login, configured agents, skills
   apply [--dry-run] [--only claude,codex,cursor,gemini,opencode] [--shell] [--adopt]
-                       register BrainMCP in every installed agent and sync skills
+                       register BrainMCP in every installed agent, each with its own key,
+                       and sync skills; --shell exports BRAIN_KEY_CODEX and friends
   uninstall [--dry-run]
                        remove everything apply added
   bridge [--config FILE]
                        expose local stdio MCP servers (default ~/.config/brain/bridge.json)
-  doctor               check node, credentials, server, agents, BRAIN_KEY
-  auth header|token    print the auth header JSON or the bare key (for agents)
-  hook post-tool       telemetry hook (reads the PostToolUse JSON on stdin)
+  doctor               check node, each agent's key, server, harnesses, BRAIN_KEY_* env
+  auth header|token [--agent NAME]
+                       print one agent's auth header JSON or bare key (default agent: cli)
+  hook post-tool [--agent NAME]
+                       telemetry hook (reads the PostToolUse JSON on stdin), sent with that agent's key
   help, --version
 `;
 
@@ -1245,7 +1496,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'logout': return cmdLogout();
     case 'whoami': return cmdWhoami();
     case 'status': return cmdStatus();
-    case 'auth': return cmdAuth(pos[1]);
+    case 'auth': return cmdAuth(pos[1], opts);
     case 'apply': return void (await runApply(opts));
     case 'uninstall': return cmdUninstall(opts);
     case 'bridge': return cmdBridge(opts);

@@ -37,7 +37,8 @@ export async function handleGatewayRoutes(req, env, url, ctx) {
     try {
       r = await finishOauth(env, url, token);
     } catch (e) {
-      r = { error: e.message };
+      r = { error: 'the connection could not be completed; start again from the console' };
+      console.log('connect callback failed:', e.name);
     }
     if (r.error) {
       auditInBackground({ env, ctx, p }, 'gw.connection.connect', { outcome: 'error', detail: r.error });
@@ -63,7 +64,10 @@ export async function handleGatewayRoutes(req, env, url, ctx) {
     if (await limited(env, req)) return Response.json({ error: 'slow_down' }, { status: 429 });
     const body = await req.json().catch(() => ({}));
     const machine = String(body.machine || '').trim().toLowerCase().slice(0, 40);
-    const agent = body.agent ? String(body.agent).trim().toLowerCase().slice(0, 40) : 'cli';
+    const asked = Array.isArray(body.agents) && body.agents.length ? body.agents : [body.agent || 'cli'];
+    const list = [...new Set(asked.map((a) => String(a).trim().toLowerCase()).filter(Boolean))].slice(0, 8);
+    if (list.some((a) => !/^[a-z0-9][a-z0-9._-]{0,39}$/.test(a))) return Response.json({ error: 'invalid_request', error_description: 'agent names must be short lowercase names' }, { status: 400 });
+    const agent = list.join(',');
     if (!/^[a-z0-9][a-z0-9._-]{0,39}$/.test(machine)) return Response.json({ error: 'invalid_request', error_description: 'machine must be a short lowercase name' }, { status: 400 });
     const device = randHex(32);
     const code = userCode();
@@ -91,10 +95,12 @@ export async function handleGatewayRoutes(req, env, url, ctx) {
     }
     const claimed = await env.DB.prepare("UPDATE device_codes SET status = 'collected' WHERE device_hash = ? AND status = 'approved'").bind(hash).run();
     if ((claimed.meta?.changes ?? 0) !== 1) return Response.json({ error: 'expired_token' }, { status: 400 });
-    const key = await decryptText(env.BRAIN_KEK, row.key_sealed).catch(() => null);
+    const sealed = await decryptText(env.BRAIN_KEK, row.key_sealed).catch(() => null);
     await env.DB.prepare('DELETE FROM device_codes WHERE device_hash = ?').bind(hash).run();
-    if (!key) return Response.json({ error: 'server_error' }, { status: 500 });
-    return Response.json({ key, machine: row.machine, agent: row.agent, mcp_url: `${url.origin}/mcp` });
+    if (!sealed) return Response.json({ error: 'server_error' }, { status: 500 });
+    const keys = sealed.startsWith('{') ? JSON.parse(sealed) : { [row.agent]: sealed };
+    const agents = Object.keys(keys);
+    return Response.json({ key: keys[agents[0]], keys, machine: row.machine, agent: agents[0], agents, mcp_url: `${url.origin}/mcp` });
   }
 
   if (url.pathname === '/bridge/connect') {

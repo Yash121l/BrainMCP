@@ -565,8 +565,10 @@ async function consoleTool(R, name, args) {
       }
       const scope = args.scope === 'hour' ? 'window' : 'once';
       const ttl = scope === 'window' ? '+60 minutes' : '+15 minutes';
-      await env.DB.prepare(`UPDATE approvals SET status = ?, scope = ?, decided_by = ?, decided = datetime('now'), expires = datetime('now', '${ttl}'), args_sealed = NULL WHERE id = ?`)
+      const done = await env.DB.prepare(`UPDATE approvals SET status = ?, scope = ?, decided_by = ?, decided = datetime('now'), expires = datetime('now', '${ttl}'), args_sealed = NULL
+          WHERE id = ? AND status = 'pending' AND expires > datetime('now')`)
         .bind(decision, scope, p.keyId || null, a.id).run();
+      if ((done.meta?.changes ?? 0) !== 1) return { error: 'this request was already decided (or expired) a moment ago; refresh to see the result' };
       audit('gw.approval', { outcome: decision, target: `${connLabel}.${a.tool}`, detail: { id: a.id, scope } });
       return { ok: true, id: a.id, status: decision, scope: scope === 'window' ? 'hour' : 'once' };
     }
@@ -715,7 +717,8 @@ async function consoleTool(R, name, args) {
       const row = await env.DB.prepare("SELECT machine, agent, created, exp FROM device_codes WHERE user_code = ? AND status = 'pending' AND exp > datetime('now')").bind(code).first();
       if (!row) return { error: 'that code is unknown or expired; run brain login again' };
       const known = await env.DB.prepare('SELECT tags FROM machines WHERE user_id = ? AND name = ? AND revoked = 0').bind(me, row.machine).first();
-      return { machine: row.machine, agent: row.agent, requested: row.created, expires: row.exp, existing_machine: !!known, machine_tags: known ? jsonList(known.tags) : [] };
+      const agents = deviceAgents(row.agent);
+      return { machine: row.machine, agent: agents[0], agents, requested: row.created, expires: row.exp, existing_machine: !!known, machine_tags: known ? jsonList(known.tags) : [] };
     }
 
     case 'gw_device_approve':
@@ -738,24 +741,35 @@ async function consoleTool(R, name, args) {
       } catch (e) {
         return { error: e.message };
       }
-      let agent;
+      let agents;
       let tags;
       try {
-        agent = cleanAgent(args.agent || row.agent || 'cli');
+        agents = (args.agent ? [args.agent] : deviceAgents(row.agent)).map(cleanAgent).filter(Boolean);
+        if (!agents.length) agents = ['cli'];
         tags = cleanTags(args.agent_tags);
       } catch (e) {
         return { error: e.message };
       }
+      // A key minted here never exceeds the session that approves it: same scopes, same
+      // space limit, an admin role only for an unscoped admin session.
+      const scoped = !!p.scopes?.length;
+      const grantRole = role === 'admin' && scoped ? 'write' : role;
       const live = await env.DB.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))").bind(me).first();
-      if (!p.super && live.n >= LIVE_KEYS_MAX) return { error: `you already have ${LIVE_KEYS_MAX} live keys; revoke one first` };
-      const created = await createKey(env, {
-        name: `${agent} @ ${machine.name}`, role, user_id: me, parent_key_id: p.keyId || null, machine_id: machine.id, agent, agent_tags: tags,
-        expires_at: p.expires || null,
-      });
+      if (!p.super && live.n + agents.length > LIVE_KEYS_MAX) return { error: `this needs ${agents.length} new keys and you have ${live.n} of ${LIVE_KEYS_MAX}; revoke some first` };
+      const keys = {};
+      const ids = [];
+      for (const agent of agents) {
+        const created = await createKey(env, {
+          name: `${agent} @ ${machine.name}`, role: grantRole, user_id: me, parent_key_id: p.keyId || null, machine_id: machine.id, agent, agent_tags: tags,
+          prefixes: p.scopes || [], space_limit: p.spaceLimit || null, expires_at: p.expires || null,
+        });
+        keys[agent] = created.key;
+        ids.push(created.id);
+      }
       await env.DB.prepare("UPDATE device_codes SET status = 'approved', user_id = ?, key_sealed = ? WHERE device_hash = ?")
-        .bind(me, await encryptWithKek(env, created.key), row.device_hash).run();
-      audit('gw.device.approve', { target: machine.name, detail: { key: created.id, agent, role } });
-      return { ok: true, machine: machine.name, agent, key_id: created.id };
+        .bind(me, await encryptWithKek(env, JSON.stringify(keys)), row.device_hash).run();
+      audit('gw.device.approve', { target: machine.name, detail: { keys: ids, agents, role: grantRole } });
+      return { ok: true, machine: machine.name, agent: agents[0], agents, key_id: ids[0], key_ids: ids };
     }
 
     default:
@@ -763,6 +777,9 @@ async function consoleTool(R, name, args) {
       throw new Error(`unknown tool: ${name}`);
   }
 }
+
+/** The agents a device code asks for: one name, or a comma-separated list (one key each). */
+export const deviceAgents = (v) => String(v || 'cli').split(',').map((x) => x.trim()).filter(Boolean).slice(0, 8);
 
 const CONNECTIONS_MAX = 60;
 const RULES_MAX = 300;
@@ -783,7 +800,7 @@ export async function forgetConnectionName(env, userId, name) {
       ? env.DB.prepare("UPDATE rules SET resource = ?, updated = datetime('now') WHERE id = ?").bind(JSON.stringify({ ...res, connections: rest }), r.id)
       : env.DB.prepare('DELETE FROM rules WHERE id = ?').bind(r.id));
   }
-  const keys = (await env.DB.prepare("SELECT id, pinned FROM api_keys WHERE user_id = ? AND pinned LIKE ?").bind(userId, `%"${name}"%`).all()).results;
+  const keys = (await env.DB.prepare('SELECT id, pinned FROM api_keys WHERE user_id = ? AND instr(pinned, ?) > 0').bind(userId, `"${name}"`).all()).results;
   for (const k of keys) stmts.push(env.DB.prepare('UPDATE api_keys SET pinned = ? WHERE id = ?').bind(JSON.stringify(jsonList(k.pinned).filter((x) => x !== name)), k.id));
   if (stmts.length) await env.DB.batch(stmts);
 }
@@ -799,7 +816,7 @@ async function renameConnection(env, userId, from, to) {
     if (hit) res.connections = res.connections.map((x) => (x === from ? to : x));
     stmts.push(env.DB.prepare("UPDATE rules SET resource = ?, note = ?, updated = datetime('now') WHERE id = ?").bind(JSON.stringify(res), note, r.id));
   }
-  for (const k of (await env.DB.prepare('SELECT id, pinned FROM api_keys WHERE user_id = ? AND pinned LIKE ?').bind(userId, `%"${from}"%`).all()).results) {
+  for (const k of (await env.DB.prepare('SELECT id, pinned FROM api_keys WHERE user_id = ? AND instr(pinned, ?) > 0').bind(userId, `"${from}"`).all()).results) {
     stmts.push(env.DB.prepare('UPDATE api_keys SET pinned = ? WHERE id = ?').bind(JSON.stringify(jsonList(k.pinned).map((x) => (x === from ? to : x))), k.id));
   }
   if (stmts.length) await env.DB.batch(stmts);

@@ -163,6 +163,19 @@ export function redact(text, secrets = []) {
   return out.replace(/\b(Bearer|Basic|token|api[_-]?key)(\s*[:=]?\s*)[A-Za-z0-9._~+/=-]{12,}/gi, '$1$2[redacted]');
 }
 
+/** Every string inside an upstream result, with known secrets replaced (tools may echo their own credentials). */
+export function scrubSecrets(value, secrets = []) {
+  const live = secrets.filter((x) => typeof x === 'string' && x.length >= 6);
+  if (!live.length) return value;
+  const walk = (v, depth) => {
+    if (typeof v === 'string') return live.some((x) => v.includes(x)) ? redact(v, live) : v;
+    if (depth > 20 || v == null || typeof v !== 'object') return v;
+    if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, depth + 1)]));
+  };
+  return walk(value, 0);
+}
+
 const secretsOf = (cred) => (cred ? [cred.secret, cred.access_token, cred.refresh_token, cred.client_secret].filter(Boolean) : []);
 
 /** The work ConnectionDO does; also runs inline when the binding is absent (tests, local tools). */
@@ -196,15 +209,16 @@ export async function runUpstream(env, connectionId, op, { tool, args } = {}, ho
     out.fromRefresh = e.fromRefresh;
     return out;
   };
+  const scrub = (v) => scrubSecrets(v, holder.secrets());
   try {
-    return await exec();
+    return scrub(await exec());
   } catch (e) {
     if (!(e instanceof UpstreamAuthError)) throw clean(e);
     if (conn.auth_kind === 'oauth' && !e.fromRefresh) {
       try {
         await holder.forceRefresh();
         holder.session.ready = false;
-        return await exec();
+        return scrub(await exec());
       } catch (e2) {
         if (!(e2 instanceof UpstreamAuthError)) throw clean(e2);
         await markStatus(env, connectionId, 'auth_required', redact(e2.message, holder.secrets()));
@@ -646,7 +660,12 @@ export async function finishOauth(env, url, sessionToken) {
   if (meta.as?.authorization_response_iss_parameter_supported && q.get('iss') !== meta.as.issuer) return { error: 'issuer mismatch in the authorization response' };
   const prior = (await loadCredential(env, conn.id).catch(() => null)) || {};
   const client = { client_id: meta.client?.client_id, client_secret: prior.client_secret || null };
-  const tokens = await exchangeCode(meta.as, client, { code: q.get('code') || '', verifier: row.verifier, redirectUri: row.redirect_uri, resource: meta.resource });
+  let tokens;
+  try {
+    tokens = await exchangeCode(meta.as, client, { code: q.get('code') || '', verifier: row.verifier, redirectUri: row.redirect_uri, resource: meta.resource });
+  } catch (e) {
+    return { error: redact(`the provider refused the sign-in: ${e.message}`, [client.client_secret, row.verifier, q.get('code'), ...secretsOf(prior)]) };
+  }
   await storeCredential(env, conn.id, { ...tokens, client_id: client.client_id, client_secret: client.client_secret });
   await env.DB.prepare("UPDATE connections SET status = 'active', last_error = NULL WHERE id = ?").bind(conn.id).run();
   return { conn: { ...conn, status: 'active' } };

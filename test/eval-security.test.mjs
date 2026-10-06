@@ -208,7 +208,7 @@ test('console tools: Bearer keys on /app/api/tool, raw keys in the cookie, and f
   const bearer = await http(env, 'POST', '/app/api/tool', { token: agent, body: { name: 'gw_overview', args: {} }, headers: { Origin: O } });
   assert.equal(bearer.status, 401);
   const rawCookie = await consoleTool(env, `brain_session=${agent}`, 'gw_overview');
-  assert.match(rawCookie.error, /web console/);
+  assert.match(rawCookie.error, /unauthorized/, 'a raw key in the cookie is not a session');
   const foreign = await http(env, 'POST', '/app/api/tool', { cookie, body: { name: 'gw_settings', args: { notify_url: null } }, headers: { Origin: 'https://evil.test' } });
   assert.equal(foreign.status, 403);
   const nullOrigin = await http(env, 'POST', '/app/api/tool', { cookie, body: { name: 'gw_settings', args: {} }, headers: { Origin: 'null' } });

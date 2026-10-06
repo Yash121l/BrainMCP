@@ -63,7 +63,8 @@ async function detectAuth(url) {
 }
 
 async function managedRules(env, userId, connNameValue) {
-  const rows = (await env.DB.prepare("SELECT * FROM rules WHERE owner_id = ? AND note LIKE ?").bind(userId, `managed:app:${connNameValue}:%`).all()).results;
+  const prefix = `managed:app:${connNameValue}:`;
+  const rows = (await env.DB.prepare('SELECT * FROM rules WHERE owner_id = ? AND substr(note, 1, length(?)) = ?').bind(userId, prefix, prefix).all()).results;
   return rows.map((r) => ({ ...r, meta: parseNote(r.note), resource: JSON.parse(r.resource || '{}'), subject: JSON.parse(r.subject || '{}') })).filter((r) => r.meta);
 }
 
@@ -91,14 +92,16 @@ async function accessView(env, userId, conn) {
       ask: mine.some((r) => r.meta.kind === 'ask'),
     };
   });
-  const custom = (await env.DB.prepare("SELECT COUNT(*) AS n FROM rules WHERE owner_id = ? AND (note IS NULL OR note NOT LIKE 'managed:%') AND resource LIKE ?").bind(userId, `%"${name}"%`).first()).n;
+  const custom = (await env.DB.prepare("SELECT COUNT(*) AS n FROM rules WHERE owner_id = ? AND (note IS NULL OR substr(note, 1, 8) != 'managed:') AND instr(resource, ?) > 0").bind(userId, `"${name}"`).first()).n;
   return { connection: name, level: permit ? levelOf(permit.resource.risks) : 'off', ask: all.some((r) => r.meta.kind === 'ask'), agents, custom_rules: custom };
 }
 
 async function writeAccess(env, userId, conn, { who, level, ask }) {
   const name = connName(conn);
-  const stmts = [];
-  for (const r of (await managedRules(env, userId, name)).filter((x) => x.meta.who === who)) stmts.push(env.DB.prepare('DELETE FROM rules WHERE id = ?').bind(r.id));
+  // Delete and insert in one batch (a D1 transaction), keyed by the exact managed notes,
+  // so two saves at once leave exactly one of them, never both.
+  const notes = ['permit', 'ask', 'block', 'cap'].map((k) => managedNote(name, who, k));
+  const stmts = [env.DB.prepare('DELETE FROM rules WHERE owner_id = ? AND note IN (SELECT value FROM json_each(?))').bind(userId, JSON.stringify(notes))];
   const subject = who === 'all' ? {} : { keys: [who] };
   const add = (effect, resource, kind) => stmts.push(env.DB.prepare(
     "INSERT INTO rules (id, owner_id, effect, subject, resource, note, created, updated) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))"
@@ -111,7 +114,7 @@ async function writeAccess(env, userId, conn, { who, level, ask }) {
     if (who !== 'all' && above.length) add('forbid', { connections: [name], risks: above }, 'cap');
   }
   if (ask && level !== 'off') add('approve', { connections: [name], risks: ASK_RISKS }, 'ask');
-  if (stmts.length) await env.DB.batch(stmts);
+  await env.DB.batch(stmts);
 }
 
 export async function appTool(R, name, args, consoleTool) {

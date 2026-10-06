@@ -81,7 +81,7 @@ ${code}
 
 export async function runCode(R, { code }) {
   const { env, ctx, p } = R;
-  if (!codeModeReady(env, ctx)) return { error: 'run_code is not enabled on this server (needs the LOADER binding and the enable_ctx_exports flag)' };
+  if (!codeModeReady(env, ctx)) return { error: 'run_code is not enabled on this server (it needs the worker_loaders binding, on the Workers Paid plan)' };
   const src = String(code || '');
   if (!src.trim()) return { error: 'code is required' };
   if (src.length > CODE_MAX) return { error: `code is over ${CODE_MAX} characters` };

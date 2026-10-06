@@ -1050,6 +1050,15 @@ const INGEST_MAX_AGE_DAYS = 8;
 const ROLLUP_PAGE = 1000; // rows read per query
 const ROLLUP_MAX_GROUPS = 100; // R2 objects written per run; the rest wait for the next run
 
+const SECRET_KEY = /pass(word|wd)?|secret|token|api[_-]?key|apikey|authorization|^auth$|cookie|session|private[_-]?key|credential/i;
+
+/** A second scrub on the server: whatever a client sent, values under credential-like keys are dropped. */
+function scrubKeys(v, depth = 0) {
+  if (depth > 12 || v == null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) return v.map((x) => scrubKeys(x, depth + 1));
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, SECRET_KEY.test(k) && x != null && typeof x !== 'object' ? '[redacted]' : scrubKeys(x, depth + 1)]));
+}
+
 /** Buffer a batch of redacted tool-call records into D1. */
 async function ingestToolCalls(env, records, p) {
   const buffered = Number((await env.DB.prepare('SELECT COUNT(*) AS c FROM tool_calls').first())?.c) || 0;
@@ -1078,7 +1087,7 @@ async function ingestToolCalls(env, records, p) {
       String(r?.cwd || '').slice(0, 300),
       normalizeProject(String(r?.project || '')).slice(0, 64),
       String(r?.tool || '').slice(0, 64),
-      JSON.stringify(r).slice(0, INGEST_PAYLOAD_CAP),
+      JSON.stringify(scrubKeys(r)).slice(0, INGEST_PAYLOAD_CAP),
       tenant,
       p.keyId || null
     );

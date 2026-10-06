@@ -39,7 +39,7 @@ test('managed block upsert/remove round-trips TOML and keeps user content', () =
   const user = 'model = "o3"\n\n[mcp_servers.other]\ncommand = "x"\n';
   const once = cli.upsertCodexConfig(user, SERVER);
   assert.ok(once.startsWith(user));
-  assert.match(once, /# >>> brain \(managed\)\n\[mcp_servers\.brain\]\nurl = "https:\/\/brain\.test\/mcp"\nbearer_token_env_var = "BRAIN_KEY"\n# <<< brain \(managed\)\n$/);
+  assert.match(once, /# >>> brain \(managed\)\n\[mcp_servers\.brain\]\nurl = "https:\/\/brain\.test\/mcp"\nbearer_token_env_var = "BRAIN_KEY_CODEX"\n# <<< brain \(managed\)\n$/);
   assert.equal(cli.upsertCodexConfig(once, SERVER), once, 'idempotent');
   const moved = cli.upsertCodexConfig(once, 'https://other.test');
   assert.equal(moved.match(/# >>> brain/g).length, 1, 'replaced, not duplicated');
@@ -60,10 +60,14 @@ test('codex refuses to add a second [mcp_servers.brain] table', () => {
   assert.throws(() => cli.upsertBlock(`${cli.BLOCK_START}\nno end\n`, 'x'), /closing line/);
 });
 
-test('shell rc block exports BRAIN_KEY and is idempotent', () => {
+test('shell rc block exports one BRAIN_KEY_<AGENT> per agent and is idempotent', () => {
   const rc = 'export PATH="$HOME/bin:$PATH"\nalias ll="ls -l"';
-  const body = cli.shellBlock('/home/me/.local/bin/brain');
-  assert.equal(body, 'export BRAIN_KEY="$(/home/me/.local/bin/brain auth token 2>/dev/null)"');
+  const body = cli.shellBlock('/home/me/.local/bin/brain', ['codex', 'cursor']);
+  assert.equal(body, [
+    'export BRAIN_KEY_CODEX="$(/home/me/.local/bin/brain auth token --agent codex 2>/dev/null)"',
+    'export BRAIN_KEY_CURSOR="$(/home/me/.local/bin/brain auth token --agent cursor 2>/dev/null)"',
+  ].join('\n'));
+  assert.equal(cli.envVarFor('claude-code'), 'BRAIN_KEY_CLAUDE_CODE');
   const once = cli.upsertBlock(rc, body);
   assert.equal(cli.upsertBlock(once, body), once);
   assert.equal(cli.removeBlock(once), `${rc}\n`);
@@ -77,16 +81,16 @@ test('cursor/gemini/opencode entries merge without touching other servers', () =
   const c1 = cli.setJsonKey(cursor, t.cursor.key, t.cursor.value);
   assert.deepEqual(c1.mcpServers.github, { url: 'https://gh' });
   assert.equal(c1.other, true);
-  assert.deepEqual(c1.mcpServers.brain, { url: `${SERVER}/mcp`, headers: { Authorization: 'Bearer ${env:BRAIN_KEY}' } });
+  assert.deepEqual(c1.mcpServers.brain, { url: `${SERVER}/mcp`, headers: { Authorization: 'Bearer ${env:BRAIN_KEY_CURSOR}' } });
   assert.deepEqual(cli.setJsonKey(c1, t.cursor.key, t.cursor.value), c1, 'idempotent');
   assert.deepEqual(cursor, { mcpServers: { github: { url: 'https://gh' } }, other: true }, 'input not mutated');
   assert.deepEqual(cli.deleteJsonKey(c1, t.cursor.key), cursor);
 
   const g = cli.setJsonKey({ theme: 'dark' }, t.gemini.key, t.gemini.value);
-  assert.deepEqual(g, { theme: 'dark', mcpServers: { brain: { httpUrl: `${SERVER}/mcp`, headers: { Authorization: 'Bearer $BRAIN_KEY' } } } });
+  assert.deepEqual(g, { theme: 'dark', mcpServers: { brain: { httpUrl: `${SERVER}/mcp`, headers: { Authorization: 'Bearer $BRAIN_KEY_GEMINI' } } } });
 
   const o = cli.setJsonKey(t.opencode.init, t.opencode.key, t.opencode.value);
-  assert.deepEqual(o.mcp.brain, { type: 'remote', url: `${SERVER}/mcp`, headers: { Authorization: 'Bearer {env:BRAIN_KEY}' }, enabled: true });
+  assert.deepEqual(o.mcp.brain, { type: 'remote', url: `${SERVER}/mcp`, headers: { Authorization: 'Bearer {env:BRAIN_KEY_OPENCODE}' }, enabled: true });
   assert.equal(o.$schema, 'https://opencode.ai/config.json');
 });
 
@@ -165,6 +169,89 @@ test('skill sync writes, prunes removed skills, and never touches unmanaged fold
   assert.deepEqual(forged.remove, ['unslop/SKILL.md'], 'manifest entries outside their own skill are ignored');
 });
 
+const outsideDir = (tag) => {
+  const d = path.join(TMP, `outside-${tag}-${homeN}`);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'SKILL.md'), 'external');
+  fs.writeFileSync(path.join(d, 'run.sh'), 'external script');
+  return d;
+};
+
+test('skill writes never follow a nested directory symlink out of the skills folder', () => {
+  const h = freshHome();
+  const base = path.join(h, '.claude', 'skills');
+  const outside = outsideDir('nested');
+  fs.mkdirSync(path.join(base, 'tdd'), { recursive: true });
+  fs.symlinkSync(outside, path.join(base, 'tdd', 'scripts'));
+  const bundle = { files: [{ path: 'tdd/SKILL.md', content: 't1' }, { path: 'tdd/scripts/run.sh', content: 'pwned' }] };
+  const r = cli.applySkills(base, bundle, { tdd: ['tdd/SKILL.md', 'tdd/scripts/run.sh'] }, quietFx());
+  assert.equal(fs.readFileSync(path.join(outside, 'run.sh'), 'utf8'), 'external script', 'external file untouched');
+  assert.equal(fs.readFileSync(path.join(base, 'tdd', 'SKILL.md'), 'utf8'), 't1');
+  assert.equal(r.refused.length, 1);
+  assert.match(r.refused[0], /tdd\/scripts\/run\.sh \(tdd\/scripts is a symlink\)/);
+  assert.deepEqual(r.managed, { tdd: ['tdd/SKILL.md'] }, 'refused file is not recorded as managed');
+
+  // Removal through the same symlinked directory is refused as well.
+  const r2 = cli.applySkills(base, { files: [] }, { tdd: ['tdd/SKILL.md', 'tdd/scripts/run.sh'] }, quietFx());
+  assert.equal(r2.removed, 1);
+  assert.ok(fs.existsSync(path.join(outside, 'run.sh')));
+  assert.ok(fs.existsSync(path.join(outside, 'SKILL.md')));
+
+  // A symlink at the final path is replaced, never written through.
+  fs.mkdirSync(path.join(base, 'solo'), { recursive: true });
+  fs.symlinkSync(path.join(outside, 'SKILL.md'), path.join(base, 'solo', 'SKILL.md'));
+  cli.applySkills(base, { files: [{ path: 'solo/SKILL.md', content: 'mine now' }] }, { solo: ['solo/SKILL.md'] }, quietFx());
+  assert.equal(fs.readFileSync(path.join(outside, 'SKILL.md'), 'utf8'), 'external');
+  assert.ok(!fs.lstatSync(path.join(base, 'solo', 'SKILL.md')).isSymbolicLink());
+  assert.equal(fs.readFileSync(path.join(base, 'solo', 'SKILL.md'), 'utf8'), 'mine now');
+
+  // A symlinked managed file is not deleted (neither the link nor its target).
+  fs.rmSync(path.join(base, 'solo', 'SKILL.md'));
+  fs.symlinkSync(path.join(outside, 'SKILL.md'), path.join(base, 'solo', 'SKILL.md'));
+  const r3 = cli.applySkills(base, { files: [] }, { solo: ['solo/SKILL.md'] }, quietFx());
+  assert.equal(r3.removed, 0);
+  assert.match(r3.refused[0], /is a symlink/);
+  assert.equal(fs.readFileSync(path.join(outside, 'SKILL.md'), 'utf8'), 'external');
+});
+
+test('a managed skill folder swapped for a symlink survives apply with an empty bundle and uninstall', async () => {
+  const h = freshHome();
+  fs.mkdirSync(path.join(h, '.claude'), { recursive: true });
+  const outside = outsideDir('swap');
+  const deps = (bundle) => ({ home: h, creds: { server: SERVER, key: 'k', keys: { cli: 'k', 'claude-code': 'k2' } }, which: () => null, selfCommand: '/opt/brain', bundle, fx: quietFx() });
+  await cli.runApply({ only: 'claude' }, deps({ files: [{ path: 'unslop/SKILL.md', content: 'u' }] }));
+  const base = path.join(h, '.claude', 'skills');
+  assert.equal(fs.readFileSync(path.join(base, 'unslop', 'SKILL.md'), 'utf8'), 'u');
+  fs.rmSync(path.join(base, 'unslop'), { recursive: true });
+  fs.symlinkSync(outside, path.join(base, 'unslop'));
+  const manifestBefore = cli.loadManifest();
+
+  const r = await cli.runApply({ only: 'claude' }, deps({ files: [] }));
+  assert.equal(fs.readFileSync(path.join(outside, 'SKILL.md'), 'utf8'), 'external', 'apply did not delete through the symlink');
+  assert.ok(r.report.claude.some((l) => /refused 1 path/.test(l)), r.report.claude.join('\n'));
+
+  // Uninstall with the manifest as it was right after install (skill still listed).
+  const summary = await cli.runUninstall({ home: h, which: () => null, fx: quietFx(), manifest: manifestBefore });
+  assert.equal(fs.readFileSync(path.join(outside, 'SKILL.md'), 'utf8'), 'external', 'uninstall did not delete through the symlink');
+  assert.ok(fs.existsSync(path.join(outside, 'run.sh')));
+  assert.ok(summary.some((l) => /left 1 path/.test(l)), summary.join('\n'));
+  assert.ok(fs.lstatSync(path.join(base, 'unslop')).isSymbolicLink(), 'the user symlink itself is left alone');
+});
+
+test('skillTarget refuses a symlinked base, files that are directories, and missing parents on removal', () => {
+  const h = freshHome();
+  const real = path.join(h, 'real');
+  fs.mkdirSync(path.join(real, 'a'), { recursive: true });
+  fs.symlinkSync(real, path.join(h, 'linked'));
+  assert.match(cli.skillTarget(path.join(h, 'linked'), 'a/SKILL.md').error, /not a real directory/);
+  assert.throws(() => cli.applySkills(path.join(h, 'linked'), { files: [] }, {}, quietFx()), /symlink/);
+  assert.deepEqual(cli.skillTarget(real, 'b/SKILL.md'), { missing: true });
+  assert.equal(cli.skillTarget(real, '../x/y').error, 'unsafe path');
+  fs.mkdirSync(path.join(real, 'a', 'SKILL.md'));
+  const r = cli.applySkills(real, { files: [{ path: 'a/SKILL.md', content: 'x' }] }, { a: ['a/SKILL.md'] }, quietFx());
+  assert.match(r.refused[0], /not a regular file/);
+});
+
 // ---------------------------------------------------------------- redaction parity with src/hook.js
 
 const hookSrc = fs.readFileSync(path.join(ROOT, 'src/hook.js'), 'utf8');
@@ -239,6 +326,49 @@ test('buildRecord() produces the same record as the python hook', { skip: !hasPy
     const { ts, ...rest } = mine;
     assert.deepEqual(rest, theirs, `payload ${i}`);
   }
+});
+
+test('redact() drops credentials by key name, recursively, whatever the value looks like', () => {
+  const input = {
+    password: 'hunter2',
+    githubToken: 'opaque',
+    'X-Api-Key': 'k',
+    api_key: 'k',
+    apikey: 'k',
+    client_secret: 'c',
+    nested: { deeper: [{ Authorization: 'Basic abc' }, { refresh_token: 'r', access_token: 'a', note: 'keep me' }], Cookie: 'sid=1' },
+    auth: { user: 'me', pass: 'p' },
+    privateKey: ['x'],
+    credentials: 'c',
+    sessionId: 's',
+    passwd: 'p',
+    author: 'Ada',
+    max_tokens: 4096,
+    deleteSession: true,
+    token: null,
+    command: 'echo hi',
+  };
+  const out = cli.redact(input);
+  for (const k of ['password', 'githubToken', 'X-Api-Key', 'api_key', 'apikey', 'client_secret', 'auth', 'privateKey', 'credentials', 'sessionId', 'passwd']) {
+    assert.equal(out[k], '<REDACTED>', k);
+  }
+  assert.equal(out.nested.deeper[0].Authorization, '<REDACTED>');
+  assert.equal(out.nested.deeper[1].refresh_token, '<REDACTED>');
+  assert.equal(out.nested.deeper[1].access_token, '<REDACTED>');
+  assert.equal(out.nested.deeper[1].note, 'keep me');
+  assert.equal(out.nested.Cookie, '<REDACTED>');
+  assert.equal(out.author, 'Ada', 'author is not "auth"');
+  assert.equal(out.max_tokens, 4096);
+  assert.equal(out.deleteSession, true);
+  assert.equal(out.token, null);
+  assert.equal(out.command, 'echo hi');
+  assert.ok(!JSON.stringify(out).includes('hunter2'));
+  assert.ok(!JSON.stringify(out).includes('opaque'));
+
+  const rec = cli.buildRecord({ session_id: 's', tool_name: 'mcp__db__connect', tool_input: { host: 'db', password: 'hunter2', apiKey: 'zz', dbSecret: 'x', limit: 3 } }, { homeDir: TMP });
+  assert.deepEqual(rec.args, { host: 'db', password: '<REDACTED>', apiKey: '<REDACTED>', dbSecret: '<REDACTED>', limit: 3 });
+  const other = cli.buildRecord({ session_id: 's', tool_name: 'Custom', tool_input: { 'x-auth-token': 'opaque1', user: 'me' } }, { homeDir: TMP });
+  assert.deepEqual(other.args, { 'x-auth-token': '<REDACTED>', user: 'me' });
 });
 
 test('Cursor and Codex hook payloads are normalized', () => {
@@ -453,6 +583,8 @@ test('bridge config validation', () => {
 
 // ---------------------------------------------------------------- apply / uninstall end to end (temp HOME)
 
+const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
+
 test('apply configures every detected harness idempotently and uninstall removes only brain entries', async () => {
   const h = freshHome();
   for (const d of ['.claude', '.codex', '.cursor', '.gemini', '.config/opencode']) fs.mkdirSync(path.join(h, d), { recursive: true });
@@ -462,7 +594,7 @@ test('apply configures every detected harness idempotently and uninstall removes
   fs.writeFileSync(path.join(h, '.zshrc'), 'alias ll="ls -l"\n');
   const deps = () => ({
     home: h,
-    creds: { server: SERVER, key: 'bk_secret_never_written' },
+    creds: { server: SERVER, key: 'bk_secret_never_written', keys: Object.fromEntries(['cli', 'claude-code', 'codex', 'cursor', 'gemini', 'opencode'].map((a) => [a, `bk_secret_never_written_${a}`])) },
     which: () => null,
     selfCommand: '/opt/brain',
     bundle: { files: [{ path: 'unslop/SKILL.md', content: 'u' }] },
@@ -478,15 +610,20 @@ test('apply configures every detected harness idempotently and uninstall removes
   assert.deepEqual(r1.found, ['claude', 'codex', 'cursor', 'gemini', 'opencode']);
   const settings = JSON.parse(fs.readFileSync(path.join(h, '.claude', 'settings.json'), 'utf8'));
   assert.equal(settings.model, 'opus');
-  assert.deepEqual(settings.hooks.PostToolUse.map((e) => e.hooks[0].command), ['fmt.sh', '/opt/brain hook post-tool']);
-  assert.match(fs.readFileSync(path.join(h, '.codex', 'config.toml'), 'utf8'), /bearer_token_env_var = "BRAIN_KEY"/);
+  assert.deepEqual(settings.hooks.PostToolUse.map((e) => e.hooks[0].command), ['fmt.sh', '/opt/brain hook post-tool --agent claude-code']);
+  assert.match(fs.readFileSync(path.join(h, '.codex', 'config.toml'), 'utf8'), /bearer_token_env_var = "BRAIN_KEY_CODEX"/);
+  assert.equal(r1.report.missing, undefined, 'every harness has its own key');
   const cursor = JSON.parse(fs.readFileSync(path.join(h, '.cursor', 'mcp.json'), 'utf8'));
   assert.deepEqual(Object.keys(cursor.mcpServers), ['github', 'brain']);
   assert.equal(JSON.parse(fs.readFileSync(path.join(h, '.gemini', 'settings.json'), 'utf8')).mcpServers.brain.httpUrl, `${SERVER}/mcp`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(h, '.config', 'opencode', 'opencode.json'), 'utf8')).mcp.brain.type, 'remote');
   assert.equal(fs.readFileSync(path.join(h, '.claude', 'skills', 'unslop', 'SKILL.md'), 'utf8'), 'u');
   assert.equal(fs.readFileSync(path.join(h, '.agents', 'skills', 'unslop', 'SKILL.md'), 'utf8'), 'u');
-  assert.match(fs.readFileSync(path.join(h, '.zshrc'), 'utf8'), /export BRAIN_KEY="\$\(\/opt\/brain auth token 2>\/dev\/null\)"/);
+  const zshrc = fs.readFileSync(path.join(h, '.zshrc'), 'utf8');
+  for (const a of ['codex', 'cursor', 'gemini', 'opencode']) {
+    assert.ok(zshrc.includes(`export BRAIN_KEY_${a.toUpperCase()}="$(/opt/brain auth token --agent ${a} 2>/dev/null)"`), zshrc);
+  }
+  assert.ok(!/export BRAIN_KEY=/.test(zshrc), 'no shared key export');
   for (const f of ['.claude/settings.json', '.codex/config.toml', '.cursor/mcp.json', '.zshrc']) {
     assert.ok(fs.existsSync(path.join(h, `${f}.brain-backup`)), `backup of ${f}`);
   }
@@ -496,7 +633,6 @@ test('apply configures every detected harness idempotently and uninstall removes
   const r2 = await cli.runApply({ shell: true }, deps());
   assert.deepEqual(r2.changed, [], 'second apply changes nothing');
 
-  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
   for (const f of walk(h)) assert.ok(!fs.readFileSync(f, 'utf8').includes('bk_secret_never_written'), `key leaked into ${f}`);
 
   const summary = await cli.runUninstall({ home: h, which: () => null, fx: quietFx() });
@@ -519,7 +655,7 @@ test('apply --only limits targets and claude registration shells out when the CL
   const fx = cli.makeFx({ dryRun: true, log: (s) => lines.push(s) });
   const r = await cli.runApply({ only: 'claude' }, { home: h, creds: { server: SERVER, key: 'k' }, which: (b) => (b === 'claude' ? '/usr/bin/claude' : null), selfCommand: 'brain', bundle: null, fx });
   assert.deepEqual(r.found, ['claude']);
-  assert.ok(lines.some((l) => l.includes(`would run claude mcp add-json -s user brain '{"type":"http","url":"${SERVER}/mcp","headersHelper":"brain auth header"}'`)), lines.join('\n'));
+  assert.ok(lines.some((l) => l.includes(`would run claude mcp add-json -s user brain '{"type":"http","url":"${SERVER}/mcp","headersHelper":"brain auth header --agent claude-code"}'`)), lines.join('\n'));
   await assert.rejects(cli.runApply({ only: 'vim' }, { home: h, creds: { server: SERVER, key: 'k' }, which: () => null, fx }), /unknown harness/);
 });
 
@@ -529,27 +665,28 @@ const runCli = (args, { home, input, env = {} } = {}) => spawnSync(process.execP
   encoding: 'utf8', input, env: { ...process.env, HOME: home, BRAIN_CRED_STORE: 'file', ...env },
 });
 
-test('login via device flow stores the key, auth prints it, other commands do not', async () => {
+test('login asks for one key per agent in a single approval; auth --agent prints each, other commands do not', async () => {
   const h = freshHome();
   const realFetch = globalThis.fetch;
   let polls = 0;
   const writes = [];
+  const issued = { cli: 'bk_cli_once', 'claude-code': 'bk_claude_once', codex: 'bk_codex_once' };
   globalThis.fetch = async (url, init) => {
     const body = JSON.parse(init.body || '{}');
     if (url.endsWith('/device/code')) {
-      assert.deepEqual(body, { machine: 'lap-top', agent: 'cli' });
+      assert.deepEqual(body, { machine: 'lap-top', agents: ['cli', 'claude-code', 'codex'] });
       return Response.json({ device_code: 'dc', user_code: 'ABCD-EFGH', interval: 0.01, expires_in: 60 });
     }
     if (url.endsWith('/device/token')) {
       polls++;
       if (polls < 2) return Response.json({ error: 'authorization_pending' }, { status: 400 });
-      return Response.json({ key: 'bk_issued_once', machine: 'lap-top', agent: 'cli', mcp_url: `${SERVER}/mcp` });
+      return Response.json({ key: issued.cli, keys: issued, machine: 'lap-top', agent: 'cli', agents: Object.keys(issued), mcp_url: `${SERVER}/mcp` });
     }
     throw new Error(`unexpected ${url}`);
   };
   cli.setOutput((s) => writes.push(String(s)));
   try {
-    await cli.main(['login', '--server', `${SERVER}/`, '--machine', 'Lap Top']);
+    await cli.main(['login', '--server', `${SERVER}/`, '--machine', 'Lap Top', '--agents', 'cli,Claude-Code,codex,cli']);
   } finally {
     globalThis.fetch = realFetch;
     cli.setOutput(null);
@@ -557,22 +694,53 @@ test('login via device flow stores the key, auth prints it, other commands do no
   const printed = writes.join('');
   globalThis.fetch = async () => new Response('<!doctype html><title>spa</title>', { status: 200, headers: { 'content-type': 'text/html' } });
   try {
-    await assert.rejects(cli.main(['login', '--server', 'https://not-brain.test']), /did not answer like a BrainMCP server \(HTTP 200, not JSON\)/);
+    await assert.rejects(cli.main(['login', '--server', 'https://not-brain.test', '--agent', 'cli']), /did not answer like a BrainMCP server \(HTTP 200, not JSON\)/);
   } finally {
     globalThis.fetch = realFetch;
   }
   assert.match(printed, /https:\/\/brain\.test\/#device\?code=ABCD-EFGH/);
-  assert.ok(!printed.includes('bk_issued_once'), 'login output never shows the key');
+  assert.match(printed, /one key per agent: cli, claude-code, codex/);
+  for (const k of Object.values(issued)) assert.ok(!printed.includes(k), 'login output never shows a key');
   const cred = path.join(h, '.config', 'brain', 'credentials.json');
   assert.equal(fs.statSync(cred).mode & 0o777, 0o600);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h, '.config', 'brain', 'config.json'), 'utf8')), { server: SERVER, machine: 'lap-top', agent: 'cli', store: 'file' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(cred, 'utf8')), { server: SERVER, keys: issued });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h, '.config', 'brain', 'config.json'), 'utf8')), { server: SERVER, machine: 'lap-top', agents: ['cli', 'claude-code', 'codex'], store: 'file' });
 
-  assert.deepEqual(JSON.parse(runCli(['auth', 'header'], { home: h }).stdout), { Authorization: 'Bearer bk_issued_once' });
-  assert.equal(runCli(['auth', 'token'], { home: h }).stdout.trim(), 'bk_issued_once');
-  const status = runCli(['status'], { home: h });
+  assert.deepEqual(JSON.parse(runCli(['auth', 'header'], { home: h }).stdout), { Authorization: 'Bearer bk_cli_once' }, 'default agent is cli');
+  assert.equal(runCli(['auth', 'token'], { home: h }).stdout.trim(), 'bk_cli_once');
+  assert.deepEqual(JSON.parse(runCli(['auth', 'header', '--agent', 'claude-code'], { home: h }).stdout), { Authorization: 'Bearer bk_claude_once' });
+  assert.equal(runCli(['auth', 'token', '--agent=codex'], { home: h }).stdout.trim(), 'bk_codex_once');
+  const none = runCli(['auth', 'token', '--agent', 'cursor'], { home: h, env: { BRAIN_KEY: 'bk_shared' } });
+  assert.equal(none.status, 1, 'no silent fallback to another key');
+  assert.match(none.stderr, /no key for agent "cursor".*brain login --agents cursor/);
+  assert.equal(runCli(['auth', 'token', '--agent', 'cursor'], { home: h, env: { BRAIN_KEY_CURSOR: 'bk_env_cursor' } }).stdout.trim(), 'bk_env_cursor', 'explicit per-agent env fallback');
+  assert.equal(runCli(['auth', 'token', '--agent', '../x'], { home: h }).status, 1);
+
+  const status = runCli(['status'], { home: h, env: { PATH: '' } });
   assert.equal(status.status, 0, status.stderr);
-  assert.ok(!status.stdout.includes('bk_issued_once'));
+  for (const k of Object.values(issued)) assert.ok(!status.stdout.includes(k));
   assert.match(status.stdout, /lap-top/);
+  assert.match(status.stdout, /key: +claude-code +stored \(file\)/);
+
+  // A second login for one agent keeps the other agents' keys.
+  polls = 5;
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body || '{}');
+    if (url.endsWith('/device/code')) {
+      assert.deepEqual(body, { machine: 'lap-top', agents: ['cursor'] });
+      return Response.json({ device_code: 'dc2', user_code: 'WXYZ-1234', interval: 0.01, expires_in: 60 });
+    }
+    return Response.json({ key: 'bk_cursor_once', keys: { cursor: 'bk_cursor_once' }, machine: 'lap-top', agent: 'cursor', agents: ['cursor'] });
+  };
+  cli.setOutput(() => {});
+  try {
+    await cli.main(['login', '--machine', 'lap-top', '--agent', 'cursor']);
+  } finally {
+    globalThis.fetch = realFetch;
+    cli.setOutput(null);
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(cred, 'utf8')).keys, { ...issued, cursor: 'bk_cursor_once' });
+  assert.equal(runCli(['auth', 'token', '--agent', 'claude-code'], { home: h }).stdout.trim(), 'bk_claude_once');
 
   const out = runCli(['logout'], { home: h });
   assert.equal(out.status, 0);
@@ -580,6 +748,69 @@ test('login via device flow stores the key, auth prints it, other commands do no
   const after = runCli(['auth', 'header'], { home: h });
   assert.equal(after.status, 1);
   assert.match(after.stderr, /not logged in/);
+});
+
+test('loginAgents: cli plus detected harnesses by default, --agents / --agent override, at most 8', () => {
+  const h = freshHome();
+  fs.mkdirSync(path.join(h, '.codex'), { recursive: true });
+  fs.mkdirSync(path.join(h, '.config', 'opencode'), { recursive: true });
+  const whichFn = (b) => (b === 'claude' ? '/usr/bin/claude' : null);
+  assert.deepEqual(cli.loginAgents({}, h, whichFn), ['cli', 'claude-code', 'codex', 'opencode']);
+  assert.deepEqual(cli.loginAgents({ agents: 'codex, cursor' }, h, whichFn), ['codex', 'cursor']);
+  assert.deepEqual(cli.loginAgents({ agent: 'Gemini' }, h, whichFn), ['gemini']);
+  assert.throws(() => cli.loginAgents({ agents: 'a,b,c,d,e,f,g,h,i' }, h, whichFn), /at most 8/);
+  assert.throws(() => cli.loginAgents({ agents: 'ok,../bad' }, h, whichFn), /must be 1-40 lowercase/);
+  assert.throws(() => cli.loginAgents({ agents: ' , ' }, h, whichFn), /at least one/);
+  assert.deepEqual(cli.issuedKeys({ key: 'k1', agent: 'cli' }, ['cli', 'codex']), { cli: 'k1' }, 'older server: one key');
+  assert.deepEqual(cli.issuedKeys({ key: 'k1', keys: { cli: 'k1', codex: 'k2', 'BAD/x': 'k3', gemini: '' } }, ['cli']), { cli: 'k1', codex: 'k2' });
+});
+
+test('a legacy single-key login migrates to agent "cli" and nothing else inherits it', () => {
+  const h = freshHome();
+  const dir = path.join(h, '.config', 'brain');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ server: SERVER, machine: 'm', agent: 'cli', store: 'file' }));
+  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({ server: SERVER, key: 'bk_legacy' }));
+  const creds = cli.loadCreds();
+  assert.equal(creds.key, 'bk_legacy');
+  assert.equal(creds.agent, 'cli');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'credentials.json'), 'utf8')), { server: SERVER, keys: { cli: 'bk_legacy' } });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')), { server: SERVER, machine: 'm', store: 'file', agents: ['cli'] });
+  assert.equal(cli.loadCreds({ agent: 'codex', required: false }), null, 'codex does not get the cli key');
+  assert.throws(() => cli.loadCreds({ agent: 'codex' }), /no key for agent "codex"/);
+  assert.equal(cli.loadCreds({ agent: 'codex', fallbackCli: true }).agent, 'cli', 'telemetry-only fallback');
+  assert.equal(cli.loadCreds().key, 'bk_legacy', 'second read after migration');
+  assert.equal(runCli(['auth', 'token'], { home: h }).stdout.trim(), 'bk_legacy');
+});
+
+test('apply wires each harness to its own identity and names the ones without a key', async () => {
+  const h = freshHome();
+  for (const d of ['.claude', '.codex', '.cursor', '.gemini', '.config/opencode']) fs.mkdirSync(path.join(h, d), { recursive: true });
+  const lines = [];
+  const fx = cli.makeFx({ log: (s) => lines.push(s) });
+  const r = await cli.runApply({ shell: true }, {
+    home: h,
+    creds: { server: SERVER, key: 'bk_cli', keys: { cli: 'bk_cli', 'claude-code': 'bk_cc', cursor: 'bk_cur' } },
+    which: (b) => (b === 'claude' ? '/usr/bin/claude' : null),
+    selfCommand: '/abs/brain',
+    bundle: null,
+    fx: { ...fx, run: (cmd, args) => { lines.push(`run ${cmd} ${args.join(' ')}`); return { status: 0, stdout: '', stderr: '' }; } },
+  });
+  const add = lines.find((l) => l.startsWith('run claude mcp add-json'));
+  assert.equal(JSON.parse(add.slice(add.indexOf('{'))).headersHelper, '/abs/brain auth header --agent claude-code');
+  const hook = JSON.parse(fs.readFileSync(path.join(h, '.claude', 'settings.json'), 'utf8')).hooks.PostToolUse[0].hooks[0].command;
+  assert.equal(hook, '/abs/brain hook post-tool --agent claude-code');
+  assert.ok(cli.isBrainHookCommand(hook) && cli.isBrainHookCommand('/abs/brain hook post-tool'));
+  assert.match(fs.readFileSync(path.join(h, '.codex', 'config.toml'), 'utf8'), /bearer_token_env_var = "BRAIN_KEY_CODEX"/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(h, '.cursor', 'mcp.json'), 'utf8')).mcpServers.brain.headers.Authorization, 'Bearer ${env:BRAIN_KEY_CURSOR}');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(h, '.gemini', 'settings.json'), 'utf8')).mcpServers.brain.headers.Authorization, 'Bearer $BRAIN_KEY_GEMINI');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(h, '.config', 'opencode', 'opencode.json'), 'utf8')).mcp.brain.headers.Authorization, 'Bearer {env:BRAIN_KEY_OPENCODE}');
+  assert.deepEqual(r.report.missing, ['codex', 'gemini', 'opencode']);
+  assert.ok(lines.some((l) => l.includes('brain login --agents codex,gemini,opencode')), lines.join('\n'));
+  assert.ok(r.report.claude.some((l) => /agent "claude-code" \(its own key\)/.test(l)));
+  assert.ok(r.report.codex.some((l) => /no key for agent "codex"/.test(l)));
+  assert.equal(r.manifest.targets.cursor.agent, 'cursor');
+  for (const f of walk(h)) assert.ok(!/bk_(cli|cc|cur)/.test(fs.readFileSync(f, 'utf8')), `key leaked into ${f}`);
 });
 
 test('hook post-tool never fails, even on garbage or when logged out', () => {
@@ -594,8 +825,41 @@ test('hook post-tool never fails, even on garbage or when logged out', () => {
   fs.writeFileSync(path.join(h, '.config', 'brain', 'config.json'), JSON.stringify({ server: 'https://127.0.0.1:1', store: 'file' }));
   const r = runCli(['hook', 'post-tool'], { home: h, input: JSON.stringify({ session_id: 's9', tool_name: 'Bash', cwd: h, tool_input: { command: 'echo token=abcdefghijk' } }) });
   assert.equal(r.status, 0);
-  const rec = JSON.parse(fs.readFileSync(path.join(h, '.cache', 'brain', 'spool', 's9.jsonl'), 'utf8'));
+  const rec = JSON.parse(fs.readFileSync(path.join(h, '.cache', 'brain', 'spool', 'cli', 's9.jsonl'), 'utf8'));
   assert.equal(rec.command, 'echo token=<REDACTED>');
+});
+
+test('hook post-tool --agent spools per agent and flushes with that agent\'s key', async () => {
+  const h = freshHome();
+  const dir = path.join(h, '.config', 'brain');
+  fs.mkdirSync(dir, { recursive: true });
+  const seen = [];
+  const srv = http.createServer((q, r) => {
+    let body = '';
+    q.on('data', (c) => { body += c; });
+    q.on('end', () => { seen.push({ auth: q.headers.authorization, n: JSON.parse(body).records.length }); r.writeHead(200, { 'content-type': 'application/json' }); r.end('{}'); });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const server = `http://127.0.0.1:${srv.address().port}`;
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ server, machine: 'm', agents: ['cli', 'claude-code'], store: 'file' }));
+    fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({ server, keys: { cli: 'bk_cli', 'claude-code': 'bk_claude' } }));
+    const input = JSON.stringify({ session_id: 'sx', tool_name: 'Bash', cwd: h, tool_input: { command: 'ls' } });
+    for (const agent of ['claude-code', 'codex']) {
+      const r = runCli(['hook', 'post-tool', '--agent', agent], { home: h, input });
+      assert.equal(r.status, 0);
+      assert.ok(fs.existsSync(path.join(h, '.cache', 'brain', 'spool', agent, 'sx.jsonl')), agent);
+    }
+    assert.equal((await runCliAsync(['hook', 'flush', '--agent', 'claude-code'], { home: h })).code, 0);
+    assert.deepEqual(seen, [{ auth: 'Bearer bk_claude', n: 1 }]);
+    assert.equal((await runCliAsync(['hook', 'flush', '--agent', 'codex'], { home: h })).code, 0);
+    assert.deepEqual(seen.at(-1), { auth: 'Bearer bk_cli', n: 1 }, 'an agent without its own key falls back to cli for telemetry');
+    assert.equal(runCli(['hook', 'post-tool', '--agent', '../../etc'], { home: h, input }).status, 0);
+    assert.ok(fs.existsSync(path.join(h, '.cache', 'brain', 'spool', 'cli', 'sx.jsonl')), 'a malformed agent spools as cli');
+    assert.equal(cli.hookAgent({ agent: 'Claude-Code' }), 'claude-code');
+  } finally {
+    srv.close();
+  }
 });
 
 test('uninstall drops the parent object it emptied but keeps the file the user had', async () => {

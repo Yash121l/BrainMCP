@@ -577,6 +577,17 @@ export function AppTile({
   )
 }
 
+/** A pasted address as a URL, or null while it is incomplete or not http(s): typing never crashes the form. */
+function parseServerUrl(raw: string): URL | null {
+  const v = raw.trim()
+  if (!/^https?:\/\/\S+$/.test(v)) return null
+  try {
+    return new URL(v)
+  } catch {
+    return null
+  }
+}
+
 /** For servers not in the directory: paste an address, BrainMCP works out how it signs in. */
 export function CustomServerCard({
   redirectUri,
@@ -590,8 +601,9 @@ export function CustomServerCard({
   const [url, setUrl] = useState('')
   const [name, setName] = useState('')
   const n = useNeeds()
-  const valid = /^https?:\/\/\S+$/.test(url.trim())
-  const displayName = name.trim() || (valid ? new URL(url.trim()).hostname.replace(/^(www|mcp|api)\./, '') : 'Custom app')
+  const parsed = parseServerUrl(url)
+  const valid = parsed != null
+  const displayName = name.trim() || (parsed ? parsed.hostname.replace(/^(www|mcp|api)\./, '') : 'Custom app')
 
   const run = async () => {
     n.setBusy(true)
@@ -655,6 +667,9 @@ export function CustomServerCard({
           />
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" aria-label="Name (optional)" />
         </div>
+        {url.trim() !== '' && !valid && (
+          <p className="text-xs text-muted-foreground">Enter the full address, starting with https://</p>
+        )}
         {n.mode !== 'idle' && (
           <NeedsFields
             id="custom"

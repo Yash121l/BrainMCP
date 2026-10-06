@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { CheckIcon, Loader2Icon, ShieldAlertIcon, TerminalIcon, XIcon } from 'lucide-react'
 
-import { attempt, gw, normalizeCode, type DeviceRequest } from '@/lib/gateway'
+import { agentList, attempt, gw, normalizeCode, type DeviceRequest } from '@/lib/gateway'
 import { stamp } from '@/lib/people'
 import { Page } from '@/components/page'
 import { Choice, Field } from '@/components/form-dialog'
@@ -91,8 +91,8 @@ export function DeviceView({ code: initial, onDone }: { code: string; onDone: ()
               <TerminalIcon className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
               <div className="min-w-0 text-sm">
                 <p className="break-words">
-                  <b className="font-mono">{req.agent ?? 'A terminal'}</b> on <b className="font-mono">{req.machine}</b>{' '}
-                  is asking for access.
+                  <b className="font-mono">{agentList(req)}</b> on <b className="font-mono">{req.machine}</b>{' '}
+                  {(req.agents?.length ?? 1) > 1 ? 'are asking for access. Each gets its own key.' : 'is asking for access.'}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Requested {stamp(req.requested)} UTC · code expires {stamp(req.expires)} UTC
@@ -127,13 +127,20 @@ export function DeviceView({ code: initial, onDone }: { code: string; onDone: ()
           />
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field
-            id="dv-agent"
-            label="Agent"
-            placeholder={req?.agent ?? 'as the terminal sent it'}
-            value={agent}
-            onChange={(e) => setAgent(e.target.value)}
-          />
+          {(req?.agents?.length ?? 1) > 1 ? (
+            <div className="grid gap-1.5 text-sm">
+              <span className="font-medium">Agents</span>
+              <span className="text-muted-foreground">{agentList(req!)}</span>
+            </div>
+          ) : (
+            <Field
+              id="dv-agent"
+              label="Agent"
+              placeholder={req?.agent ?? 'as the terminal sent it'}
+              value={agent}
+              onChange={(e) => setAgent(e.target.value)}
+            />
+          )}
           <Field
             id="dv-machine"
             label="Device"

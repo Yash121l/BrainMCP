@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
-import { attempt, gw, isOwn, normalizeCode, useGw, type DeviceRequest, type GwKey, type Machine } from '@/lib/gateway'
+import { agentList, attempt, gw, isOwn, normalizeCode, useGw, type DeviceRequest, type GwKey, type Machine } from '@/lib/gateway'
 import { accessMap, effectiveFor, type AccessMap } from '@/lib/access'
 import { LEVEL_LABEL, ago, appLabel, deviceKind } from '@/lib/apps'
 import { Page } from '@/components/page'
@@ -470,7 +470,7 @@ export function AddDeviceDialog({
             {req && (
               <div className="grid gap-2 rounded-xl border border-border p-4" aria-live="polite">
                 <p className="text-sm">
-                  <b>{req.agent ?? 'A terminal'}</b> on <b>{req.machine}</b> is asking to sign in
+                  <b>{agentList(req)}</b> on <b>{req.machine}</b> {(req.agents?.length ?? 1) > 1 ? 'are asking to sign in, one key each' : 'is asking to sign in'}
                   {req.existing_machine ? ' (a device you already have).' : ' (a new device).'}
                 </p>
                 <p className="flex items-start gap-2 text-xs text-amber-300">

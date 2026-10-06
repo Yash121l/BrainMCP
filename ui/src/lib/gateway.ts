@@ -208,9 +208,18 @@ export type Share = {
 }
 export type Shares = { outgoing: Share[]; incoming: Share[] }
 
+/** "claude-code, codex and cursor" for a device asking on behalf of several harnesses. */
+export function agentList(req: { agent: string | null; agents?: string[] }): string {
+  const list = req.agents?.length ? req.agents : req.agent ? [req.agent] : []
+  if (!list.length) return 'A terminal'
+  return list.length === 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`
+}
+
 export type DeviceRequest = {
   machine: string
   agent: string | null
+  /** One key is minted per agent; the CLI asks for every harness it found. */
+  agents?: string[]
   requested: string
   expires: string
   existing_machine: boolean

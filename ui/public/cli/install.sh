@@ -37,4 +37,4 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add it to your PATH:  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc   (or ~/.bashrc)" ;;
 esac
-echo "Next:  brain login && brain apply"
+echo "Next:  brain login && brain apply   (one approval in the console, one key per coding agent)"

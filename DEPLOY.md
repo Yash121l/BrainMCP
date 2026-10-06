@@ -37,9 +37,10 @@ Without it, only connections with `auth: none` work; the console says so.
 Optional, off by default in `wrangler.jsonc`:
 - **Semantic memory.** `npx wrangler vectorize create brain-notes --dimensions=1024 --metric=cosine`,
   uncomment the `ai` and `vectorize` bindings, deploy, then `POST /admin/embed` (the nightly cron keeps it current).
-- **Code mode** (`run_code`). Needs the Workers Paid plan. Uncomment
-  `compatibility_flags: ["enable_ctx_exports"]` and `worker_loaders`. Each distinct
-  snippet is a new Dynamic Worker (1,000 a month included, then $0.002 each per day).
+- **Code mode** (`run_code`). Needs the Workers Paid plan. Uncomment `worker_loaders`
+  (ctx.exports is already on at this compatibility date; adding `enable_ctx_exports`
+  stops the Worker from starting). Each distinct snippet is a new Dynamic Worker
+  (1,000 a month included, then $0.002 each per day).
 
 ## Setting up a machine (Mac, VPS, anything with Claude Code)
 No checkout, no clone, no sync daemon. Two commands and a scoped key:

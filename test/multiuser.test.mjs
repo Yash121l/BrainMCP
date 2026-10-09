@@ -364,6 +364,43 @@ test('review fixes: space-limited and scoped user keys stay inside their limits'
   assert.match((await tool(env, w.key, 'audit_log')).error, /forbidden/);
 });
 
+test('a super key reaches every space, so it cannot be space-limited', async () => {
+  const { env } = await setup();
+  const sk = await superKey(env);
+  await onboard(env, sk, 'alice');
+  assert.match((await tool(env, sk, 'create_key', { name: 'x', role: 'super', spaces: ['@yash'] })).error, /every space/);
+
+  const u = env.DB.sqlite.prepare('SELECT id FROM users WHERE is_super = 1').get();
+  const yash = env.DB.sqlite.prepare("SELECT id FROM spaces WHERE handle = 'yash'").get();
+  const legacy = (await createKey(env, { name: 'old', role: 'super', user_id: u.id, space_limit: [yash.id] })).key;
+  assert.match((await tool(env, legacy, 'create_key', { name: 'x', role: 'super' })).error, /only a super key/);
+  const login = await http(env, 'POST', '/app/login', null, { body: new URLSearchParams({ access_key: legacy }) });
+  const cookie = login.headers.get('set-cookie').match(/brain_session=[^;]+/)[0];
+  const me = await (await http(env, 'GET', '/app/api/me', null, { headers: { Cookie: cookie } })).json();
+  assert.equal(me.super, false);
+
+  const full = await http(env, 'POST', '/app/login', null, { body: new URLSearchParams({ access_key: sk }) });
+  const fullCookie = full.headers.get('set-cookie').match(/brain_session=[^;]+/)[0];
+  const fullMe = await (await http(env, 'GET', '/app/api/me', null, { headers: { Cookie: fullCookie } })).json();
+  assert.ok(fullMe.spaces.some((s) => s.handle === '@alice' && s.access === 'super'));
+});
+
+test('a super key lasts a year by default and can be set to never expire', async () => {
+  const { env } = await setup();
+  await tool(env, env.BRAIN_TOKEN, 'whoami');
+  const u = env.DB.sqlite.prepare('SELECT id FROM users WHERE is_super = 1').get();
+  const yearly = await createKey(env, { name: 'y', role: 'super', user_id: u.id });
+  const forever = await createKey(env, { name: 'f', role: 'super', user_id: u.id, expires_days: 'never' });
+  const row = (id) => env.DB.sqlite.prepare("SELECT julianday(expires) - julianday('now') AS left, expires FROM api_keys WHERE id = ?").get(id);
+  assert.ok(Math.abs(row(yearly.id).left - 365) < 1);
+  assert.equal(row(forever.id).expires, null);
+
+  const child = await tool(env, forever.key, 'create_key', { name: 'c', role: 'super', expires_days: 'never' });
+  assert.equal(child.expires, null);
+  const capped = await tool(env, yearly.key, 'create_key', { name: 'c2', role: 'super', expires_days: 'never' });
+  assert.equal(capped.expires, row(yearly.id).expires);
+});
+
 test('review fixes: child keys die with their parent and never outlive it; live keys are capped', async () => {
   const { env } = await setup();
   const sk = await superKey(env);

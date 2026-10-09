@@ -26,7 +26,7 @@ const USER_TOOLS = [
   { name: 'create_space', description: 'Create a team space you own (up to 5). Add people with add_member.', inputSchema: obj({ handle: str }, ['handle']) },
   { name: 'add_member', description: 'Invite a user into a space you own or admin (they must accept), or change a member\'s role.', inputSchema: obj({ space: str, user: str, role: { type: 'string', enum: MEMBER_ROLES } }, ['space', 'user', 'role']) },
   { name: 'remove_member', description: 'Remove a user from a space you own or admin.', inputSchema: obj({ space: str, user: str }, ['space', 'user']) },
-  { name: 'create_key', description: 'Mint a key for yourself, e.g. for another machine or agent. It can never exceed this key; spaces limits it further. machine and agent name the device and agent that will hold it (gateway rules match on them); a child key inherits both from this key unless given. Shown once.', inputSchema: obj({ name: str, role: { type: 'string', enum: ['read', 'write', 'admin', 'super'] }, spaces: { type: 'array', items: str }, expires_days: { type: 'number' }, machine: { type: 'string', description: 'device name, e.g. "macbook-pro"' }, agent: { type: 'string', description: 'agent name, e.g. "codex"' }, agent_tags: { type: 'array', items: str } }, ['name', 'role']) },
+  { name: 'create_key', description: 'Mint a key for yourself, e.g. for another machine or agent. It can never exceed this key; spaces limits it further. machine and agent name the device and agent that will hold it (gateway rules match on them); a child key inherits both from this key unless given. Shown once.', inputSchema: obj({ name: str, role: { type: 'string', enum: ['read', 'write', 'admin', 'super'] }, spaces: { type: 'array', items: str }, expires_days: { type: ['number', 'string'], description: 'days, or "never"; a super key defaults to 365 and reaches every space' }, machine: { type: 'string', description: 'device name, e.g. "macbook-pro"' }, agent: { type: 'string', description: 'agent name, e.g. "codex"' }, agent_tags: { type: 'array', items: str } }, ['name', 'role']) },
   { name: 'list_keys', description: 'Your keys (never the secrets).', inputSchema: obj({ all: { type: 'boolean', description: 'super admin only: every user\'s keys' } }) },
   { name: 'revoke_key', description: 'Revoke one of your keys; its web sessions and connector tokens die with it.', inputSchema: obj({ id: str }, ['id']) },
   { name: 'audit_log', description: 'Audit events you may see: your own actions, actions on spaces you own or admin, and any access to your data, including by the super admin.', inputSchema: obj({ limit: { type: 'number' }, action: str, before: { type: 'number' } }) },
@@ -276,10 +276,12 @@ export async function tenantTool(R, name, args) {
       const role = String(args.role || '');
       if (!['read', 'write', 'admin', 'super'].includes(role)) return { error: 'role must be read, write, admin or super' };
       if (role === 'super' && !p.super) return denied(R, 'key.create', 'only a super key can mint a super key');
+      if (role === 'super' && args.spaces?.length) return { error: 'a super key reaches every space; mint an admin key to limit spaces' };
       const live = await env.DB.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ? AND revoked = 0 AND (expires IS NULL OR expires = '' OR expires > datetime('now'))").bind(p.user.id).first();
       if (!p.super && live.c >= LIVE_KEYS_PER_USER) return { error: `you already have ${LIVE_KEYS_PER_USER} live keys; revoke one first` };
-      const days = args.expires_days == null || args.expires_days === '' ? null : Math.max(1, Math.min(3650, Number(args.expires_days) | 0));
-      const wanted = days ? Date.now() + days * 86400000 : role === 'super' ? Date.now() + 7 * 86400000 : null;
+      const never = args.expires_days === 'never';
+      const days = never || args.expires_days == null || args.expires_days === '' ? null : Math.max(1, Math.min(3650, Number(args.expires_days) | 0));
+      const wanted = days ? Date.now() + days * 86400000 : role === 'super' && !never ? Date.now() + 365 * 86400000 : null;
       const parentEnds = p.expires ? Date.parse(`${String(p.expires).replace(' ', 'T')}Z`) : null;
       const ends = parentEnds && (!wanted || parentEnds < wanted) ? parentEnds : wanted;
       let limit = null;

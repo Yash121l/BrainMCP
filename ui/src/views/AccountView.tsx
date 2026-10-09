@@ -60,21 +60,14 @@ function NewKeyDialog({ me, who, onDone }: { me: Me; who: WhoAmI; onDone: () => 
     { value: 'read', label: 'read', hint: 'read notes and skills' },
     { value: 'write', label: 'write', hint: 'read, and save sessions, decisions and notes' },
     { value: 'admin', label: 'admin', hint: 'everything you can do, including keys and sharing' },
-    ...(me.super ? [{ value: 'super' as Role, label: 'super', hint: 'super admin, at most 7 days' }] : []),
+    ...(me.super ? [{ value: 'super' as Role, label: 'super', hint: 'super admin, every space' }] : []),
   ]
-  const expiry =
-    role === 'super'
-      ? [
-          { value: 1, label: '1 day' },
-          { value: 3, label: '3 days' },
-          { value: 7, label: '7 days' },
-        ]
-      : [
-          { value: 30, label: '30 days' },
-          { value: 90, label: '90 days' },
-          { value: 365, label: '1 year' },
-          { value: 0, label: 'never' },
-        ]
+  const expiry = [
+    { value: 30, label: '30 days' },
+    { value: 90, label: '90 days' },
+    { value: 365, label: '1 year' },
+    { value: 0, label: 'never' },
+  ]
   return (
     <FormDialog
       trigger={
@@ -97,8 +90,8 @@ function NewKeyDialog({ me, who, onDone }: { me: Me; who: WhoAmI; onDone: () => 
         const r = await runTool<{ key: string }>('create_key', {
           name: name.trim(),
           role,
-          ...(spaces.length ? { spaces } : {}),
-          ...(days ? { expires_days: days } : {}),
+          ...(spaces.length && role !== 'super' ? { spaces } : {}),
+          expires_days: days || 'never',
         })
         if (!r) return 'stay'
         onDone()
@@ -113,28 +106,30 @@ function NewKeyDialog({ me, who, onDone }: { me: Me; who: WhoAmI; onDone: () => 
           options={roles}
           onChange={(r) => {
             setRole(r)
-            setDays(r === 'super' ? 7 : 90)
+            setDays(r === 'super' ? 365 : 90)
           }}
         />
       </div>
-      <div className="grid gap-1.5">
-        <Label>Spaces</Label>
-        <div className="grid gap-1.5 rounded-md border border-border p-2.5">
-          {who.spaces.map((s) => (
-            <label key={s.space} className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={spaces.includes(s.space)}
-                onCheckedChange={(v) =>
-                  setSpaces((prev) => (v ? [...prev, s.space] : prev.filter((x) => x !== s.space)))
-                }
-              />
-              {s.space}
-              <span className="text-xs text-muted-foreground">{s.role}</span>
-            </label>
-          ))}
+      {role !== 'super' && (
+        <div className="grid gap-1.5">
+          <Label>Spaces</Label>
+          <div className="grid gap-1.5 rounded-md border border-border p-2.5">
+            {who.spaces.map((s) => (
+              <label key={s.space} className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={spaces.includes(s.space)}
+                  onCheckedChange={(v) =>
+                    setSpaces((prev) => (v ? [...prev, s.space] : prev.filter((x) => x !== s.space)))
+                  }
+                />
+                {s.space}
+                <span className="text-xs text-muted-foreground">{s.role}</span>
+              </label>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">Leave all unticked to reach every space you can.</p>
         </div>
-        <p className="text-xs text-muted-foreground">Leave all unticked to reach every space you can.</p>
-      </div>
+      )}
       <div className="grid gap-1.5">
         <Label>Expires</Label>
         <Choice value={days} options={expiry} onChange={setDays} />

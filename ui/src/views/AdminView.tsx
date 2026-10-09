@@ -54,8 +54,8 @@ function NotSuper() {
           Sign in with your super key to open the admin console
         </div>
         <p className="mt-2 text-sm text-muted-foreground">
-          This session came from an ordinary key, so it can see your own brain but not other people. Super
-          keys last at most 7 days. Yours is in <code className="font-mono text-xs">~/.config/brain-mcp/super-key</code>.
+          This session came from an ordinary key, so it can see your own brain but not other people. Your
+          super key is in <code className="font-mono text-xs">~/.config/brain-mcp/super-key</code>.
           From a super session you can mint the next one under Account.
         </p>
         <Button

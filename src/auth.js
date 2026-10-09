@@ -133,7 +133,7 @@ async function withUser(env, p, userId, spaceLimit) {
     ? await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first().catch(() => null)
     : await superUser(env);
   if ((userId && !user) || (user && user.status !== 'active')) return null;
-  const isSuper = !!user?.is_super && (p.via === 'root' || p.role === 'super');
+  const isSuper = !!user?.is_super && (p.via === 'root' || p.role === 'super') && !spaceLimit;
   return {
     ...p,
     role: p.role === 'super' && !isSuper ? 'admin' : p.role,
@@ -248,8 +248,8 @@ const expiresSql = (days) =>
 export async function prepareKey(env, { name, role = 'read', prefixes = [], expires_days = null, expires_at = null, user_id = null, space_limit = null, parent_key_id = null,
   machine_id = null, agent = null, agent_tags = [], pinned = [] }, guard = null) {
   if (!ROLES.includes(role)) throw new Error('role must be read|write|admin|super');
-  if (role === 'super' && (expires_days == null || expires_days === '')) expires_days = 7;
-  if (role === 'super' && Number(expires_days) > 7) throw new Error('super keys expire within 7 days');
+  if (expires_days === 'never') expires_days = null;
+  else if (role === 'super' && (expires_days == null || expires_days === '')) expires_days = 365;
   const scopes = normalizeScopes(prefixes);
   checkGrant(role, scopes);
   const id = 'k_' + randToken(6);

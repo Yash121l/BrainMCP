@@ -12,6 +12,6 @@
     "test": "node --import ./test/helpers/register-cf.mjs --test test/*.test.mjs"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "4.121.0"
   }
 }

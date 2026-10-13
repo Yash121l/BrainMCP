@@ -1,0 +1,33 @@
+name: Check
+
+on:
+  pull_request:
+  workflow_call:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix ui --no-audit --no-fund
+
+      - name: Test
+        run: npm test
+
+      - name: Lint UI
+        run: npm run lint --prefix ui
+
+      - name: Typecheck and build UI
+        run: npm run build --prefix ui

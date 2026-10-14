@@ -1,5 +1,5 @@
 import { BrainMark } from '@/components/logo'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
 import {
@@ -14,6 +14,7 @@ import {
 import type { WhoAmI } from '@/lib/people'
 import { buildIndex } from '@/lib/notes'
 import { isOwn } from '@/lib/gateway'
+import { identifyUser, track, trackScreen } from '@/lib/analytics'
 import { useGuides, type Page as GuidePage } from '@/lib/guides'
 import { PulseProvider, usePulse } from '@/lib/pulse'
 import { Sidebar, TopBar, type Dest } from '@/components/shell'
@@ -65,6 +66,9 @@ function readHash(): Route | null {
 const hashFor = (dest: Dest, sub = '', query = '') => `#${dest}${sub ? `/${sub}` : ''}${query ? `?${query}` : ''}`
 
 const initialRoute = readHash()
+
+/** A note's frontmatter type (project, session, topic...) if it is a plain word; nothing else from the note. */
+const noteType = (t: unknown) => (typeof t === 'string' && /^[a-z-]{1,20}$/.test(t) ? t : null)
 
 export default function App() {
   const [auth, setAuth] = useState<Auth>('checking')
@@ -121,11 +125,22 @@ function Shell({
     setRoute({ dest, sub, params: new URLSearchParams(query) })
   }, [])
 
+  // One pageview per screen (the hash route); the first comes from posthog's own init.
+  const firstScreen = useRef(true)
+  useEffect(() => {
+    if (firstScreen.current) {
+      firstScreen.current = false
+      return
+    }
+    trackScreen()
+  }, [route.dest, route.sub])
+
   // Back from OAuth: "#apps?connected=figma_main" (or the old "#connections?..."). Show it once.
   useEffect(() => {
     const done = route.dest === 'apps' ? route.params.get('connected') : null
     if (done) {
       setConnected(done)
+      track('app_connected', { auth: 'oauth' })
       go('apps', '', '', true)
     }
   }, [route, go])
@@ -158,6 +173,7 @@ function Shell({
         if (!alive()) return
         setMe(m)
         setAuth('in')
+        identifyUser(m.user_id)
         if (m.user) {
           api
             .tool<WhoAmI>('whoami')
@@ -231,6 +247,7 @@ function Shell({
         if (!alive) return
         setNote(n)
         setNoteLoading(false)
+        track('note_opened', { note_type: noteType(n.frontmatter?.type) })
       })
       .catch((e) => {
         if (!alive) return

@@ -2,6 +2,9 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 
 import './index.css'
+import { initAnalytics } from './lib/analytics'
+
+initAnalytics()
 
 // Dark unless the OS asks for light; follow changes live.
 const light = window.matchMedia('(prefers-color-scheme: light)')

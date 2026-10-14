@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 
 import { api, Unauthorized, type Role } from '@/lib/api'
+import { track } from '@/lib/analytics'
 
 export type Risk = 'read' | 'write' | 'destructive' | 'critical'
 export const RISKS: Risk[] = ['read', 'write', 'destructive', 'critical']
@@ -354,7 +355,14 @@ const call = <T,>(name: string, args: object = {}) => api.tool<T>(name, args as 
 export const gw = {
   home: () => call<Home>('gw_home'),
   catalog: (query?: string) => call<Catalog>('gw_catalog', query ? { query } : {}),
-  connectApp: (input: ConnectAppInput) => toolBody<ConnectAppResult>('gw_connect_app', input),
+  connectApp: (input: ConnectAppInput) =>
+    toolBody<ConnectAppResult>('gw_connect_app', input).then((r) => {
+      // catalog id only; a custom server's URL stays private
+      const app_id = input.url ? 'custom' : (input.app_id ?? null)
+      // OAuth apps finish on the redirect back (App.tsx, "?connected=")
+      if (r.ok && !r.authorize_url) track('app_connected', { app_id, auth: 'token' })
+      return r
+    }),
   appAccess: (id: string) => call<AppAccess>('gw_app_access', { id }),
   setAppAccess: (id: string, level: AgentLevel, ask: boolean, key_id?: string) =>
     call<Ok & { access: AppAccess }>('gw_set_app_access', { id, level, ask, ...(key_id ? { key_id } : {}) }),
@@ -378,7 +386,10 @@ export const gw = {
   approvals: (status?: 'pending' | 'approved' | 'denied' | 'expired') =>
     call<{ approvals: Approval[] }>('gw_approvals', status ? { status } : {}),
   decide: (id: string, decision: 'approve' | 'deny', scope: 'once' | 'hour' = 'once') =>
-    call<Ok & { status: 'approved' | 'denied'; scope: 'once' | 'hour' }>('gw_approval_decide', { id, decision, scope }),
+    call<Ok & { status: 'approved' | 'denied'; scope: 'once' | 'hour' }>('gw_approval_decide', { id, decision, scope }).then((r) => {
+      track('approval_decided', { decision, scope })
+      return r
+    }),
   machines: () => call<Machines>('gw_machines'),
   updateMachine: (id: string, tags: string[]) => call<Ok>('gw_machine_update', { id, tags }),
   revokeMachine: (id: string) => call<Ok & { revoked_keys: number }>('gw_machine_revoke', { id }),
@@ -399,7 +410,10 @@ export const gw = {
   decline: (id: string) => call<Ok>('gw_connection_decline', { id }),
   lookupDevice: (user_code: string) => call<DeviceRequest>('gw_device_lookup', { user_code }),
   approveDevice: (input: DeviceInput) =>
-    call<Ok & { machine: string; agent: string; key_id: string }>('gw_device_approve', input),
+    call<Ok & { machine: string; agent: string; key_id: string }>('gw_device_approve', input).then((r) => {
+      track('device_approved', { role: input.role ?? null })
+      return r
+    }),
   denyDevice: (user_code: string) => call<Ok>('gw_device_deny', { user_code }),
 }
 

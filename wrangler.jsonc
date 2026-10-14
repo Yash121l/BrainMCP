@@ -49,7 +49,10 @@
   "vars": {
     "REPO": "Yash121l/brain",
     "BRANCH": "main",
-    "SUPER_HANDLE": "yash"
+    "SUPER_HANDLE": "yash",
+    // PostHog public project key: MCP tool-call analytics (src/analytics.js) and the
+    // /ingest proxy the web console sends its events through. Unset = analytics off.
+    "POSTHOG_KEY": "phc_oLm8fb7L4CXDqGdJcc7a6boCtR8rVjf6dNx7G995eGdy"
   },
   "durable_objects": {
     "bindings": [

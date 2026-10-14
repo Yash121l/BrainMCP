@@ -2,6 +2,8 @@
 // A 401 anywhere means the brain_session cookie is gone -> surface as Unauthorized
 // so the shell can drop back to the login screen.
 
+import { resetUser, track } from './analytics'
+
 export class Unauthorized extends Error {
   constructor() {
     super('unauthorized')
@@ -24,6 +26,8 @@ export type Me = {
   name: string
   prefixes: string[]
   user: string | null
+  /** Internal user id, for analytics identify only. */
+  user_id: string | null
   super: boolean
   super_user: boolean
   can_invite: boolean
@@ -131,19 +135,28 @@ export const api = {
       (d) => d.backlinks,
     ),
   search: (q: string, signal?: AbortSignal) =>
-    req<{ results: SearchHit[] }>(inSpace(`search?q=${encodeURIComponent(q)}`), { signal }).then(
-      (d) => d.results,
-    ),
+    req<{ results: SearchHit[] }>(inSpace(`search?q=${encodeURIComponent(q)}`), { signal }).then((d) => {
+      // counts only: the query itself never leaves the console
+      track('search_run', { query_length: q.length, result_count: d.results.length })
+      return d.results
+    }),
   graph: () => req<GraphData>(inSpace('graph')),
   keys: () => req<{ keys: ApiKey[] }>('keys').then((d) => d.keys),
   check: () => req<HealthReport>(inSpace('check')),
   skills: () => req<SkillsConfig>(inSpace('skills')),
   saveSkills: (entries: SkillEntryInput[]) =>
-    req<{ ok: true; commit: string }>(inSpace('skills'), json({ entries }, 'PUT')),
+    req<{ ok: true; commit: string }>(inSpace('skills'), json({ entries }, 'PUT')).then((r) => {
+      track('skills_saved', { projects: entries.length, skills: entries.reduce((n, e) => n + e.skills.length, 0) })
+      return r
+    }),
   tool: <T,>(name: string, args: Record<string, unknown> = {}) =>
     req<T>('tool', json({ name, args })),
   scopes: () => req<Scopes>('scopes'),
-  createKey: (body: KeyInput) => req<{ id: string; key: string }>('keys', json(body)),
+  createKey: (body: KeyInput) =>
+    req<{ id: string; key: string }>('keys', json(body)).then((r) => {
+      track('key_created', { role: body.role, scoped: body.prefixes.length > 0, expires_days: body.expires_days })
+      return r
+    }),
   updateKey: (id: string, patch: Partial<KeyInput>) =>
     req<{ key: ApiKey }>('keys', json({ id, ...patch }, 'PATCH')).then((d) => d.key),
   revokeKey: (id: string) => req<{ ok: true }>('keys/revoke', json({ id })),
@@ -151,6 +164,7 @@ export const api = {
 
 export async function logout() {
   await fetch('/app/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {})
+  resetUser()
 }
 
 /** Log in with an access key. Returns an error message, or null on success. */

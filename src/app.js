@@ -237,6 +237,7 @@ export async function handleApp(req, env, url, ctx, callTool = null) {
       return Response.json({
         role: p ? p.role : 'none', name: key?.name || principal.name, prefixes: p ? (p.scopes ?? p.prefixes) : [],
         user: principal.user ? `@${principal.user.handle}` : null,
+        user_id: principal.user?.id ?? null,
         super: !!principal.super,
         super_user: !!principal.user?.is_super,
         can_invite: !!principal.user?.can_invite,

@@ -136,6 +136,16 @@ curl -fsSL -H "Authorization: Bearer $KEY" https://brain.yashlunawat.com/hooks/i
 It drops the hook, registers it in `~/.claude/settings.json`, removes any stale brain
 hook, and writes the key to `~/.config/brain-mcp/credentials`. Re-run it to upgrade.
 
+### Product analytics (PostHog)
+Separate from the hook above. `src/analytics.js` sends one `$mcp_tool_call` per MCP
+tool call (tool name, category, duration, success, an error category) and one
+`$mcp_initialize` per handshake (client name and version), keyed by the internal user
+id. Tool arguments, results, note paths and contents, queries and error text are never
+sent. The web console (`ui/src/lib/analytics.ts`) uses posthog-js through the Worker's
+`/ingest/*` proxy, with replays fully text-masked, autocapture text off and URL hashes
+dropped. `POSTHOG_KEY` in `wrangler.jsonc` vars and `ui/.env.production` hold the public
+project key; remove them to turn analytics off.
+
 ## Ops
 ```bash
 npm run deploy                      # build ui/ then wrangler deploy

@@ -25,6 +25,7 @@ import { gatewayTool, gatewayToolDefs, isGatewayTool, RAW } from './gateway-tool
 import { handleGatewayRoutes, BridgeDO } from './routes.js';
 import { ToolBridge, setBrainCaller } from './codemode.js';
 import { setUpstreamPolicy } from './upstream.js';
+import { proxyPostHog, trackToolCall, trackInitialize } from './analytics.js';
 import { fitContext, liveDecisions, rrfFuse, semanticPaths, semanticReady, embedPending, consolidationProposals, estimateTokens } from './memory.js';
 
 export { SpaceDO, AuditDO, ConnectionDO, BridgeDO, ToolBridge };
@@ -978,24 +979,34 @@ function rpcError(id, code, message) {
 async function handleRpc(R, msg) {
   const { id, method, params } = msg;
   switch (method) {
-    case 'initialize':
+    case 'initialize': {
+      const protocolVersion = SUPPORTED_PROTOCOLS.includes(params?.protocolVersion) ? params.protocolVersion : SUPPORTED_PROTOCOLS[0];
+      trackInitialize(R, params, protocolVersion);
       return rpcResult(id, {
-        protocolVersion: SUPPORTED_PROTOCOLS.includes(params?.protocolVersion) ? params.protocolVersion : SUPPORTED_PROTOCOLS[0],
+        protocolVersion,
         capabilities: { tools: { listChanged: false }, resources: { listChanged: false } },
         serverInfo: { name: 'brain-mcp', title: 'ClaudeBrain Vault', version: '2.0.0' },
         instructions: INSTRUCTIONS,
       });
+    }
     case 'ping':
       return rpcResult(id, {});
     case 'tools/list':
       return rpcResult(id, { tools: [...TOOLS, ...tenantToolDefs(R.p), ...(await gatewayToolDefs(R))] });
     case 'tools/call': {
+      const name = params?.name;
+      const call = { name, startedAt: Date.now(), category: isGatewayTool(name) ? 'gateway' : isTenantTool(name) ? 'tenant' : 'brain' };
       try {
-        const result = await callTool(R, params?.name, params?.arguments || {});
-        if (result?.[RAW]) return rpcResult(id, result[RAW]);
+        const result = await callTool(R, name, params?.arguments || {});
+        if (result?.[RAW]) {
+          trackToolCall(R, { ...call, isError: !!result[RAW]?.isError, error: 'upstream' });
+          return rpcResult(id, result[RAW]);
+        }
         const structured = result && typeof result === 'object' && !Array.isArray(result) ? { structuredContent: result } : {};
+        trackToolCall(R, { ...call, isError: !!result?.error, error: result?.error });
         return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(result) }], ...structured, isError: !!result?.error });
       } catch (e) {
+        trackToolCall(R, { ...call, isError: true, error: e.message });
         return rpcResult(id, { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
       }
     }
@@ -1255,6 +1266,8 @@ async function archiveAudit(env) {
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
+    // PostHog reverse proxy for the web console (/ingest/tool-calls is the hook's own endpoint)
+    if (url.pathname.startsWith('/ingest/') && url.pathname !== '/ingest/tool-calls') return proxyPostHog(req, url);
     setUpstreamPolicy(env);
     await ensureSchema(env);
     await ensureSystemSpace(env).catch((e) => console.log('system space setup failed:', e.message));
@@ -1438,7 +1451,7 @@ export default {
       if (env.MCP_LIMITER && !(await env.MCP_LIMITER.limit({ key: principal.keyId || 'root' })).success) {
         return Response.json(rpcError(null, -32000, 'rate limited: too many calls from this key'), { status: 429, headers: { 'Retry-After': '60' } });
       }
-      const R = { env, ctx, p: principal, url };
+      const R = { env, ctx, p: principal, url, req };
       let body;
       try { body = await req.json(); } catch { return Response.json(rpcError(null, -32700, 'parse error'), { status: 400 }); }
       if (Array.isArray(body) && (!body.length || body.length > RPC_BATCH_CAP)) {

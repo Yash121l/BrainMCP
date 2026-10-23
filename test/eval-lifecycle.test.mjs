@@ -4,7 +4,6 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { fakeEnv, fakeCtx, fakeDONamespace, stubFetch, sha256hex as sha } from './helpers/fake-env.mjs';
@@ -19,11 +18,11 @@ import { createUser } from '../src/tenancy.js';
 const O = 'https://brain.test';
 const VAULT_KEK = Buffer.alloc(32, 9).toString('base64');
 const SECRET = 'figma-pat-SECRET-0123456789';
-const ROOT = new URL('..', import.meta.url).pathname;
 
-// Control schema 3 as it shipped in 368fdf3, the last release before the gateway.
-const V3_COMMIT = '368fdf3';
-const V3_SQL = execFileSync('git', ['show', `${V3_COMMIT}:schema.sql`], { cwd: ROOT, encoding: 'utf8' });
+// Control schema 3 and src/audit.js as they shipped in 368fdf3, the last release before the gateway.
+// Snapshotted into test/fixtures/v3 so the test does not need git history (CI checks out shallow).
+const V3_FIXTURES = new URL('./fixtures/v3/', import.meta.url);
+const V3_SQL = readFileSync(new URL('schema.sql', V3_FIXTURES), 'utf8');
 const DEV_SQL = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8');
 // The version the Worker migrates to (the gateway branch bumps it; read it, do not hard-code it).
 const TARGET_VERSION = /CONTROL_SCHEMA_VERSION = '(\d+)'/.exec(readFileSync(new URL('../src/schema.js', import.meta.url), 'utf8'))[1];
@@ -249,10 +248,8 @@ async function v3Database() {
 }
 
 test('migration: src/audit.js is byte-identical to production (so the seeded v3 hash chain is faithful)', () => {
-  for (const f of ['src/audit.js']) {
-    const prod = execFileSync('git', ['show', `${V3_COMMIT}:${f}`], { cwd: ROOT, encoding: 'utf8' });
-    assert.equal(readFileSync(new URL(`../${f}`, import.meta.url), 'utf8'), prod, `${f} changed since v3; the seed may not be faithful`);
-  }
+  const prod = readFileSync(new URL('audit.js.txt', V3_FIXTURES), 'utf8');
+  assert.equal(readFileSync(new URL('../src/audit.js', import.meta.url), 'utf8'), prod, 'src/audit.js changed since v3; the seed may not be faithful');
 });
 
 test('migration 3 -> current: every new table and column appears, old rows get defaults, version is bumped', async () => {
